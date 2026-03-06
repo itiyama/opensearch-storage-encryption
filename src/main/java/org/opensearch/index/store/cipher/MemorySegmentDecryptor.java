@@ -80,6 +80,9 @@ public class MemorySegmentDecryptor {
      * Use for single-shot decryption where the cipher won't be reused.
      */
     private static void decryptChunked(Cipher cipher, ByteBuffer src, ByteBuffer dst, int length) throws Exception {
+        if (length < 0) {
+            throw new IllegalArgumentException("length must not be negative (possible long-to-int overflow): " + length);
+        }
         decryptStream(cipher, src, dst, length);
 
         byte[] tail = new byte[DEFAULT_MAX_CHUNK_SIZE];
@@ -247,6 +250,8 @@ public class MemorySegmentDecryptor {
             }
             srcOffset += size;
         }
+        // AES-CTR has no pending buffered bytes, so doFinal() produces no output.
+        // Called only to reset the cipher for reuse by the pool.
         cipher.doFinal();
     }
 

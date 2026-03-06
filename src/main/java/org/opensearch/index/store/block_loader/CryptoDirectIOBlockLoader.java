@@ -101,7 +101,7 @@ public class CryptoDirectIOBlockLoader implements BlockLoader<RefCountedMemorySe
             byte[] masterKey = keyResolver.getDataKey().getEncoded();
 
             // Get footer from disk and load metadata (footer + derived key) atomically into cache
-            EncryptionFooter footer = readFooterFromDisk(filePath, masterKey);
+            EncryptionFooter footer = readFooterFromDisk(normalizedPath, filePath, masterKey);
 
             // Get or create metadata atomically - ensures footer and key are always consistent
             var metadata = encryptionMetadataCache.getOrLoadMetadata(normalizedPath, footer, masterKey);
@@ -175,14 +175,15 @@ public class CryptoDirectIOBlockLoader implements BlockLoader<RefCountedMemorySe
     private void releaseHandles(RefCountedMemorySegment[] handles, int upTo) {
         for (int i = 0; i < upTo; i++) {
             if (handles[i] != null) {
+                // Zero out plaintext/partial-plaintext before returning segment to pool
+                handles[i].segment().fill((byte) 0);
                 handles[i].close();
+                handles[i] = null;
             }
         }
     }
 
-    private EncryptionFooter readFooterFromDisk(Path filePath, byte[] masterKey) throws IOException {
-        String normalizedPath = filePath.toAbsolutePath().normalize().toString();
-
+    private EncryptionFooter readFooterFromDisk(String normalizedPath, Path filePath, byte[] masterKey) throws IOException {
         // Check cache first for fast path
         EncryptionFooter cachedFooter = encryptionMetadataCache.getFooter(normalizedPath);
         if (cachedFooter != null) {
