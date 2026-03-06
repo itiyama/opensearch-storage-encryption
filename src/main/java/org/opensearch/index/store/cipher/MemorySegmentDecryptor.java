@@ -49,6 +49,65 @@ public class MemorySegmentDecryptor {
     }
 
     /**
+     * Core decrypt loop: reads chunks from src, decrypts via cipher.update(), writes to dst.
+     * Does NOT call cipher.doFinal() — caller is responsible for finalization.
+     * When src and dst are the same buffer, this is an in-place decrypt.
+     */
+    private static void decryptStream(Cipher cipher, ByteBuffer src, ByteBuffer dst, int length) throws Exception {
+        final int CHUNK_SIZE = Math.min(DEFAULT_MAX_CHUNK_SIZE, length);
+        byte[] chunk = new byte[CHUNK_SIZE];
+        byte[] decryptedChunk = new byte[CHUNK_SIZE];
+
+        int position = 0;
+        while (position < length) {
+            int size = Math.min(CHUNK_SIZE, length - position);
+
+            src.position(position);
+            src.get(chunk, 0, size);
+
+            int decryptedLength = cipher.update(chunk, 0, size, decryptedChunk, 0);
+            if (decryptedLength > 0) {
+                dst.position(position);
+                dst.put(decryptedChunk, 0, decryptedLength);
+            }
+
+            position += size;
+        }
+    }
+
+    /**
+     * Decrypt and finalize: streams data then calls doFinal().
+     * Use for single-shot decryption where the cipher won't be reused.
+     */
+    private static void decryptChunked(Cipher cipher, ByteBuffer src, ByteBuffer dst, int length) throws Exception {
+        decryptStream(cipher, src, dst, length);
+
+        byte[] tail = new byte[DEFAULT_MAX_CHUNK_SIZE];
+        int finalLength = cipher.doFinal(new byte[0], 0, 0, tail, 0);
+        if (finalLength > 0) {
+            dst.position(length - finalLength);
+            dst.put(tail, 0, finalLength);
+        }
+    }
+
+    /**
+     * Initializes a cipher for AES-CTR decryption at the given file offset, advancing past
+     * any non-block-aligned prefix bytes.
+     */
+    private static Cipher initCipher(byte[] key, byte[] iv, long fileOffset) throws Exception {
+        Cipher cipher = CIPHER_POOL.get();
+        SecretKeySpec keySpec = new SecretKeySpec(key, AesCipherFactory.ALGORITHM);
+        byte[] ivCopy = AesCipherFactory.computeOffsetIVForAesGcmEncrypted(iv, fileOffset);
+        cipher.init(Cipher.DECRYPT_MODE, keySpec, new IvParameterSpec(ivCopy));
+
+        int skip = (int) (fileOffset & ((1 << AesCipherFactory.AES_BLOCK_SIZE_BYTES_IN_POWER) - 1));
+        if (skip > 0) {
+            cipher.update(ZERO_SKIP, 0, skip);
+        }
+        return cipher;
+    }
+
+    /**
      * Performs in-place AES-CTR decryption on a memory region specified by address within an arena scope.
      *
      * <p>This method decrypts the specified memory region directly, modifying the contents in place.
@@ -67,45 +126,10 @@ public class MemorySegmentDecryptor {
      * @throws Exception if decryption fails due to cryptographic errors or memory access issues
      */
     public static void decryptInPlace(Arena arena, long addr, long length, byte[] key, byte[] iv, long fileOffset) throws Exception {
-        // Get thread-local cipher
-        Cipher cipher = CIPHER_POOL.get();
-        SecretKeySpec keySpec = new SecretKeySpec(key, AesCipherFactory.ALGORITHM);
-        byte[] ivCopy = AesCipherFactory.computeOffsetIVForAesGcmEncrypted(iv, fileOffset);
-
-        cipher.init(Cipher.DECRYPT_MODE, keySpec, new IvParameterSpec(ivCopy));
-
-        if ((fileOffset & ((AesCipherFactory.AES_BLOCK_SIZE_BYTES_IN_POWER) - 1)) > 0) {
-            cipher.update(ZERO_SKIP, 0, (int) (fileOffset & ((1 << AesCipherFactory.AES_BLOCK_SIZE_BYTES_IN_POWER) - 1)));
-        }
-
+        Cipher cipher = initCipher(key, iv, fileOffset);
         MemorySegment segment = MemorySegment.ofAddress(addr).reinterpret(length, arena, null);
         ByteBuffer buffer = segment.asByteBuffer();
-
-        final int CHUNK_SIZE = Math.min(DEFAULT_MAX_CHUNK_SIZE, (int) length); // typecast is safe.
-        byte[] chunk = new byte[CHUNK_SIZE];
-        byte[] decryptedChunk = new byte[CHUNK_SIZE];
-
-        int position = 0;
-        while (position < buffer.capacity()) {
-            int size = Math.min(CHUNK_SIZE, buffer.capacity() - position);
-
-            buffer.position(position);
-            buffer.get(chunk, 0, size);
-
-            int decryptedLength = cipher.update(chunk, 0, size, decryptedChunk, 0);
-            if (decryptedLength > 0) {
-                buffer.position(position);
-                buffer.put(decryptedChunk, 0, decryptedLength);
-            }
-
-            position += size;
-        }
-
-        int finalLength = cipher.doFinal(new byte[0], 0, 0, decryptedChunk, 0);
-        if (finalLength > 0) {
-            buffer.position(position - finalLength);
-            buffer.put(decryptedChunk, 0, finalLength);
-        }
+        decryptChunked(cipher, buffer, buffer, (int) length);
     }
 
     /**
@@ -126,44 +150,22 @@ public class MemorySegmentDecryptor {
      * @throws Exception if decryption fails due to cryptographic errors or memory access issues
      */
     public static void decryptInPlace(long addr, long length, byte[] key, byte[] iv, long fileOffset) throws Exception {
-        Cipher cipher = CIPHER_POOL.get();
-        SecretKeySpec keySpec = new SecretKeySpec(key, AesCipherFactory.ALGORITHM);
-        byte[] ivCopy = AesCipherFactory.computeOffsetIVForAesGcmEncrypted(iv, fileOffset);
-
-        cipher.init(Cipher.DECRYPT_MODE, keySpec, new IvParameterSpec(ivCopy));
-
-        if ((fileOffset & ((1 << AesCipherFactory.AES_BLOCK_SIZE_BYTES_IN_POWER) - 1)) > 0) {
-            cipher.update(ZERO_SKIP, 0, (int) (fileOffset & ((1 << AesCipherFactory.AES_BLOCK_SIZE_BYTES_IN_POWER) - 1)));
-        }
-
+        Cipher cipher = initCipher(key, iv, fileOffset);
         MemorySegment segment = MemorySegment.ofAddress(addr).reinterpret(length);
         ByteBuffer buffer = segment.asByteBuffer();
+        decryptChunked(cipher, buffer, buffer, (int) length);
+    }
 
-        final int CHUNK_SIZE = Math.min(DEFAULT_MAX_CHUNK_SIZE, (int) length); // typecast is safe.
-        byte[] chunk = new byte[CHUNK_SIZE];
-        byte[] decryptedChunk = new byte[CHUNK_SIZE];
-
-        int position = 0;
-        while (position < buffer.capacity()) {
-            int size = Math.min(CHUNK_SIZE, buffer.capacity() - position);
-
-            buffer.position(position);
-            buffer.get(chunk, 0, size);
-
-            int decryptedLength = cipher.update(chunk, 0, size, decryptedChunk, 0);
-            if (decryptedLength > 0) {
-                buffer.position(position);
-                buffer.put(decryptedChunk, 0, decryptedLength);
-            }
-
-            position += size;
-        }
-
-        int finalLength = cipher.doFinal(new byte[0], 0, 0, decryptedChunk, 0);
-        if (finalLength > 0) {
-            buffer.position(position - finalLength);
-            buffer.put(decryptedChunk, 0, finalLength);
-        }
+    /**
+     * Decrypts from a source address directly into a separate destination address.
+     * Avoids the in-place decrypt + copy pattern by writing plaintext straight to the destination.
+     */
+    public static void decryptToDestination(long srcAddr, long dstAddr, long length, byte[] key, byte[] iv, long fileOffset)
+        throws Exception {
+        Cipher cipher = initCipher(key, iv, fileOffset);
+        ByteBuffer srcBuffer = MemorySegment.ofAddress(srcAddr).reinterpret(length).asByteBuffer();
+        ByteBuffer dstBuffer = MemorySegment.ofAddress(dstAddr).reinterpret(length).asByteBuffer();
+        decryptChunked(cipher, srcBuffer, dstBuffer, (int) length);
     }
 
     /**
@@ -184,35 +186,181 @@ public class MemorySegmentDecryptor {
      * @throws Exception if decryption fails due to cryptographic errors or segment access issues
      */
     public static void decryptSegment(MemorySegment segment, long fileOffset, byte[] key, byte[] iv, int segmentSize) throws Exception {
-        Cipher cipher = CIPHER_POOL.get();
-        SecretKeySpec keySpec = new SecretKeySpec(key, AesCipherFactory.ALGORITHM);
-        byte[] ivCopy = AesCipherFactory.computeOffsetIVForAesGcmEncrypted(iv, fileOffset);
-
-        cipher.init(Cipher.DECRYPT_MODE, keySpec, new IvParameterSpec(ivCopy));
-
-        if ((fileOffset & ((1 << AesCipherFactory.AES_BLOCK_SIZE_BYTES_IN_POWER) - 1)) > 0) {
-            cipher.update(ZERO_SKIP, 0, (int) (fileOffset & ((1 << AesCipherFactory.AES_BLOCK_SIZE_BYTES_IN_POWER) - 1)));
-        }
-
+        Cipher cipher = initCipher(key, iv, fileOffset);
         ByteBuffer buffer = segment.asByteBuffer();
-        final int CHUNK_SIZE = Math.min(DEFAULT_MAX_CHUNK_SIZE, segmentSize);
+        decryptChunked(cipher, buffer, buffer, segmentSize);
+    }
+
+    /**
+     * Bulk decrypt from a contiguous source into multiple destination chunks with a single cipher init.
+     * Non-frame-based variant for use when the caller manages IV computation directly.
+     * Streams across all chunks without resetting the cipher between them.
+     * Allocates heap transfer arrays once and reuses across all chunks.
+     */
+    public static void decryptToChunkedDestinations(
+        long srcAddr,
+        long[] dstAddrs,
+        int[] chunkSizes,
+        int chunkCount,
+        byte[] key,
+        byte[] iv,
+        long fileOffset
+    ) throws Exception {
+        Cipher cipher = initCipher(key, iv, fileOffset);
+        decryptBulkStreaming(cipher, srcAddr, dstAddrs, chunkSizes, chunkCount);
+    }
+
+    /**
+     * Core bulk streaming decrypt: single cipher, one contiguous source, multiple destination chunks.
+     * Allocates heap arrays once and reuses them across all chunks.
+     */
+    private static void decryptBulkStreaming(Cipher cipher, long srcAddr, long[] dstAddrs, int[] chunkSizes, int chunkCount)
+        throws Exception {
+        // Find max chunk size for heap array allocation
+        int maxChunk = 0;
+        for (int i = 0; i < chunkCount; i++) {
+            maxChunk = Math.max(maxChunk, chunkSizes[i]);
+        }
+        final int CHUNK_SIZE = Math.min(DEFAULT_MAX_CHUNK_SIZE, maxChunk);
         byte[] chunk = new byte[CHUNK_SIZE];
         byte[] decryptedChunk = new byte[CHUNK_SIZE];
 
-        int position = 0;
-        while (position < buffer.capacity()) {
-            int size = Math.min(CHUNK_SIZE, buffer.capacity() - position);
+        long srcOffset = 0;
+        for (int i = 0; i < chunkCount; i++) {
+            int size = chunkSizes[i];
+            ByteBuffer srcBuf = MemorySegment.ofAddress(srcAddr + srcOffset).reinterpret(size).asByteBuffer();
+            ByteBuffer dstBuf = MemorySegment.ofAddress(dstAddrs[i]).reinterpret(size).asByteBuffer();
 
-            buffer.position(position);
-            buffer.get(chunk, 0, size);
+            int position = 0;
+            while (position < size) {
+                int toRead = Math.min(CHUNK_SIZE, size - position);
 
-            int decryptedLength = cipher.update(chunk, 0, size, decryptedChunk, 0);
-            if (decryptedLength > 0) {
-                buffer.position(position);
-                buffer.put(decryptedChunk, 0, decryptedLength);
+                srcBuf.position(position);
+                srcBuf.get(chunk, 0, toRead);
+
+                int decryptedLength = cipher.update(chunk, 0, toRead, decryptedChunk, 0);
+                if (decryptedLength > 0) {
+                    dstBuf.position(position);
+                    dstBuf.put(decryptedChunk, 0, decryptedLength);
+                }
+                position += toRead;
             }
+            srcOffset += size;
+        }
+        cipher.doFinal();
+    }
 
-            position += size;
+    /**
+     * Frame-based decryption directly into a destination buffer, handling frame boundaries.
+     */
+    public static void decryptToDestinationFrameBased(
+        long srcAddr,
+        long dstAddr,
+        long length,
+        byte[] fileKey,
+        byte[] directoryKey,
+        byte[] messageId,
+        long frameSize,
+        long fileOffset,
+        String filePath,
+        EncryptionMetadataCache cache
+    ) throws Exception {
+
+        long frameNumber = fileOffset / frameSize;
+        long offsetWithinFrame = fileOffset % frameSize;
+
+        // Fast path: single frame
+        if (offsetWithinFrame + length <= frameSize) {
+            byte[] frameIV = AesCipherFactory.computeFrameIV(directoryKey, messageId, frameNumber, offsetWithinFrame, filePath, cache);
+            decryptToDestination(srcAddr, dstAddr, length, fileKey, frameIV, offsetWithinFrame);
+            return;
+        }
+
+        // Slow path: multi-frame
+        long remaining = length;
+        long currentOffset = fileOffset;
+        long bufferOffset = 0;
+
+        while (remaining > 0) {
+            frameNumber = currentOffset / frameSize;
+            long frameStart = frameNumber * frameSize;
+            long frameEnd = frameStart + frameSize;
+            long bytesInFrame = Math.min(remaining, frameEnd - currentOffset);
+
+            byte[] frameIV = AesCipherFactory
+                .computeFrameIV(directoryKey, messageId, frameNumber, currentOffset - frameStart, filePath, cache);
+
+            decryptToDestination(srcAddr + bufferOffset, dstAddr + bufferOffset, bytesInFrame, fileKey, frameIV, currentOffset);
+
+            currentOffset += bytesInFrame;
+            bufferOffset += bytesInFrame;
+            remaining -= bytesInFrame;
+        }
+    }
+
+    /**
+     * Bulk decrypt from a contiguous source into multiple destination chunks with a single cipher init per frame.
+     * Avoids per-block cipher re-initialization overhead.
+     *
+     * @param srcAddr base address of contiguous ciphertext
+     * @param dstAddrs array of destination addresses, one per chunk
+     * @param chunkSizes array of sizes for each destination chunk
+     * @param chunkCount number of chunks
+     * @param fileKey derived file encryption key
+     * @param directoryKey master key for IV computation
+     * @param messageId message ID from the encryption footer
+     * @param frameSize encryption frame size
+     * @param fileOffset starting file offset of the source data
+     * @param filePath normalized file path for frame IV cache lookup
+     * @param cache encryption metadata cache
+     */
+    public static void decryptToChunkedDestinationsFrameBased(
+        long srcAddr,
+        long[] dstAddrs,
+        int[] chunkSizes,
+        int chunkCount,
+        byte[] fileKey,
+        byte[] directoryKey,
+        byte[] messageId,
+        long frameSize,
+        long fileOffset,
+        String filePath,
+        EncryptionMetadataCache cache
+    ) throws Exception {
+
+        long frameNumber = fileOffset / frameSize;
+        long offsetWithinFrame = fileOffset % frameSize;
+
+        // Compute total length
+        long totalLength = 0;
+        for (int i = 0; i < chunkCount; i++) {
+            totalLength += chunkSizes[i];
+        }
+
+        // Fast path: all chunks within a single frame (common case)
+        if (offsetWithinFrame + totalLength <= frameSize) {
+            byte[] frameIV = AesCipherFactory.computeFrameIV(directoryKey, messageId, frameNumber, offsetWithinFrame, filePath, cache);
+            Cipher cipher = initCipher(fileKey, frameIV, offsetWithinFrame);
+            decryptBulkStreaming(cipher, srcAddr, dstAddrs, chunkSizes, chunkCount);
+            return;
+        }
+
+        // Slow path: multi-frame - fall back to per-chunk decryption
+        long srcOffset = 0;
+        for (int i = 0; i < chunkCount; i++) {
+            decryptToDestinationFrameBased(
+                srcAddr + srcOffset,
+                dstAddrs[i],
+                chunkSizes[i],
+                fileKey,
+                directoryKey,
+                messageId,
+                frameSize,
+                fileOffset + srcOffset,
+                filePath,
+                cache
+            );
+            srcOffset += chunkSizes[i];
         }
     }
 

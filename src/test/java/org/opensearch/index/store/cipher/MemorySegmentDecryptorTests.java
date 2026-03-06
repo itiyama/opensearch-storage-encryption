@@ -287,6 +287,112 @@ public class MemorySegmentDecryptorTests extends OpenSearchTestCase {
         }
     }
 
+    public void testDecryptToDestinationMatchesInPlace() throws Exception {
+        // Verify decryptToDestination produces byte-identical output to decryptInPlace
+        int dataSize = 32768;
+        byte[] testData = new byte[dataSize];
+        new SecureRandom().nextBytes(testData);
+
+        // Encrypt
+        Cipher cipher = AesCipherFactory.CIPHER_POOL.get();
+        SecretKeySpec keySpec = new SecretKeySpec(TEST_KEY, "AES");
+        byte[] offsetIV = AesCipherFactory.computeOffsetIVForAesGcmEncrypted(TEST_IV, 0);
+        cipher.init(Cipher.ENCRYPT_MODE, keySpec, new IvParameterSpec(offsetIV));
+        byte[] encrypted = cipher.doFinal(testData);
+
+        // Path A: decryptInPlace
+        MemorySegment segA = arena.allocate(encrypted.length);
+        for (int i = 0; i < encrypted.length; i++) {
+            segA.set(ValueLayout.JAVA_BYTE, i, encrypted[i]);
+        }
+        MemorySegmentDecryptor.decryptInPlace(arena, segA.address(), encrypted.length, TEST_KEY, TEST_IV, 0);
+
+        // Path B: decryptToDestination (separate src and dst)
+        MemorySegment srcSeg = arena.allocate(encrypted.length);
+        MemorySegment dstSeg = arena.allocate(encrypted.length);
+        for (int i = 0; i < encrypted.length; i++) {
+            srcSeg.set(ValueLayout.JAVA_BYTE, i, encrypted[i]);
+        }
+        MemorySegmentDecryptor.decryptToDestination(srcSeg.address(), dstSeg.address(), encrypted.length, TEST_KEY, TEST_IV, 0);
+
+        // Compare byte-for-byte
+        byte[] resultA = new byte[testData.length];
+        byte[] resultB = new byte[testData.length];
+        for (int i = 0; i < testData.length; i++) {
+            resultA[i] = segA.get(ValueLayout.JAVA_BYTE, i);
+            resultB[i] = dstSeg.get(ValueLayout.JAVA_BYTE, i);
+        }
+        assertArrayEquals(resultA, resultB);
+        assertArrayEquals(testData, resultB);
+    }
+
+    public void testDecryptToDestinationWithOffset() throws Exception {
+        long fileOffset = 1024;
+        byte[] testData = new byte[8192];
+        new SecureRandom().nextBytes(testData);
+
+        // Encrypt with offset
+        Cipher cipher = AesCipherFactory.CIPHER_POOL.get();
+        SecretKeySpec keySpec = new SecretKeySpec(TEST_KEY, "AES");
+        byte[] offsetIV = AesCipherFactory.computeOffsetIVForAesGcmEncrypted(TEST_IV, fileOffset);
+        cipher.init(Cipher.ENCRYPT_MODE, keySpec, new IvParameterSpec(offsetIV));
+        int skipBytes = (int) (fileOffset % (1 << AesCipherFactory.AES_BLOCK_SIZE_BYTES_IN_POWER));
+        if (skipBytes > 0) {
+            cipher.update(new byte[skipBytes]);
+        }
+        byte[] encrypted = cipher.doFinal(testData);
+
+        // decryptInPlace
+        MemorySegment segA = arena.allocate(encrypted.length);
+        for (int i = 0; i < encrypted.length; i++) {
+            segA.set(ValueLayout.JAVA_BYTE, i, encrypted[i]);
+        }
+        MemorySegmentDecryptor.decryptInPlace(arena, segA.address(), encrypted.length, TEST_KEY, TEST_IV, fileOffset);
+
+        // decryptToDestination
+        MemorySegment srcSeg = arena.allocate(encrypted.length);
+        MemorySegment dstSeg = arena.allocate(encrypted.length);
+        for (int i = 0; i < encrypted.length; i++) {
+            srcSeg.set(ValueLayout.JAVA_BYTE, i, encrypted[i]);
+        }
+        MemorySegmentDecryptor.decryptToDestination(srcSeg.address(), dstSeg.address(), encrypted.length, TEST_KEY, TEST_IV, fileOffset);
+
+        byte[] resultA = new byte[testData.length];
+        byte[] resultB = new byte[testData.length];
+        for (int i = 0; i < testData.length; i++) {
+            resultA[i] = segA.get(ValueLayout.JAVA_BYTE, i);
+            resultB[i] = dstSeg.get(ValueLayout.JAVA_BYTE, i);
+        }
+        assertArrayEquals(resultA, resultB);
+        assertArrayEquals(testData, resultB);
+    }
+
+    public void testDecryptToDestinationPreservesSource() throws Exception {
+        byte[] testData = new byte[4096];
+        new SecureRandom().nextBytes(testData);
+
+        Cipher cipher = AesCipherFactory.CIPHER_POOL.get();
+        SecretKeySpec keySpec = new SecretKeySpec(TEST_KEY, "AES");
+        byte[] offsetIV = AesCipherFactory.computeOffsetIVForAesGcmEncrypted(TEST_IV, 0);
+        cipher.init(Cipher.ENCRYPT_MODE, keySpec, new IvParameterSpec(offsetIV));
+        byte[] encrypted = cipher.doFinal(testData);
+
+        MemorySegment srcSeg = arena.allocate(encrypted.length);
+        MemorySegment dstSeg = arena.allocate(encrypted.length);
+        for (int i = 0; i < encrypted.length; i++) {
+            srcSeg.set(ValueLayout.JAVA_BYTE, i, encrypted[i]);
+        }
+
+        MemorySegmentDecryptor.decryptToDestination(srcSeg.address(), dstSeg.address(), encrypted.length, TEST_KEY, TEST_IV, 0);
+
+        // Source should still contain ciphertext
+        byte[] srcAfter = new byte[encrypted.length];
+        for (int i = 0; i < encrypted.length; i++) {
+            srcAfter[i] = srcSeg.get(ValueLayout.JAVA_BYTE, i);
+        }
+        assertArrayEquals("Source buffer should be unmodified", encrypted, srcAfter);
+    }
+
     public void testChunkedDecryption() throws Exception {
         // Test that chunked processing works correctly
         int dataSize = 20000; // Larger than default chunk size

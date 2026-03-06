@@ -32,16 +32,17 @@ import org.opensearch.index.store.pool.Pool;
 
 /**
  * A {@link BlockLoader} implementation that loads encrypted file blocks using Direct I/O
- * and automatically decrypts them in-place.
+ * and decrypts directly into pool-managed destination buffers.
  *
  * <p>This loader combines high-performance Direct I/O with transparent decryption to provide
- * efficient access to encrypted file data. It reads blocks directly from storage, bypassing
- * the OS buffer cache, then decrypts the data in memory using the configured key and IV resolver.
+ * efficient access to encrypted file data. It reads ciphertext blocks from storage bypassing
+ * the OS buffer cache, then decrypts each block directly into its destination pool segment,
+ * avoiding an intermediate in-place decrypt plus copy.
  *
  * <p>Key features:
  * <ul>
  * <li>Direct I/O for high performance and reduced memory pressure</li>
- * <li>Automatic in-place decryption of loaded blocks</li>
+ * <li>Zero-copy decrypt: ciphertext is decrypted straight into the cache buffer</li>
  * <li>Memory pool integration for efficient buffer management</li>
  * <li>Block-aligned operations for optimal storage performance</li>
  * </ul>
@@ -107,51 +108,54 @@ public class CryptoDirectIOBlockLoader implements BlockLoader<RefCountedMemorySe
             byte[] messageId = metadata.getFooter().getMessageId();
             byte[] fileKey = metadata.getFileKey();
 
-            // Use frame-based decryption with derived file key
-            MemorySegmentDecryptor
-                .decryptInPlaceFrameBased(
-                    readBytes.address(),
-                    readBytes.byteSize(),
-                    fileKey,                                    // Derived file key (matches write path)
-                    masterKey,                                  // Master key for IV computation
-                    messageId,                                  // Message ID from footer
-                    org.opensearch.index.store.footer.EncryptionMetadataTrailer.DEFAULT_FRAME_SIZE, // Frame size
-                    startOffset,                                 // File offset
-                    filePath.toAbsolutePath().normalize().toString(),
-                    encryptionMetadataCache
-                );
-
             if (bytesRead == 0) {
                 throw new java.io.EOFException("Unexpected EOF or empty read at offset " + startOffset + " for file " + filePath);
             }
 
-            int blockIndex = 0;
+            // Acquire all pool segments first, then bulk-decrypt from the arena buffer (ciphertext)
+            // directly into each pool segment (plaintext) with a single cipher init.
+            int actualBlockCount = 0;
+            long[] dstAddrs = new long[(int) blockCount];
+            int[] chunkSizes = new int[(int) blockCount];
             long bytesCopied = 0;
 
             try {
-                while (blockIndex < blockCount && bytesCopied < bytesRead) {
-                    // Use caller-specified timeout (5s for critical loads, 50ms for prefetch)
+                while (actualBlockCount < blockCount && bytesCopied < bytesRead) {
                     RefCountedMemorySegment handle = segmentPool.tryAcquire(poolTimeoutMs, TimeUnit.MILLISECONDS);
-
-                    MemorySegment pooled = handle.segment();
+                    result[actualBlockCount] = handle;
 
                     int remaining = (int) (bytesRead - bytesCopied);
                     int toCopy = Math.min(CACHE_BLOCK_SIZE, remaining);
 
-                    if (toCopy > 0) {
-                        MemorySegment.copy(readBytes, bytesCopied, pooled, 0, toCopy);
-                    }
-
-                    result[blockIndex++] = handle;  // Store the handle, not the segment
+                    dstAddrs[actualBlockCount] = handle.segment().address();
+                    chunkSizes[actualBlockCount] = toCopy;
+                    actualBlockCount++;
                     bytesCopied += toCopy;
                 }
 
+                if (actualBlockCount > 0) {
+                    MemorySegmentDecryptor
+                        .decryptToChunkedDestinationsFrameBased(
+                            readBytes.address(),
+                            dstAddrs,
+                            chunkSizes,
+                            actualBlockCount,
+                            fileKey,
+                            masterKey,
+                            messageId,
+                            EncryptionMetadataTrailer.DEFAULT_FRAME_SIZE,
+                            startOffset,
+                            normalizedPath,
+                            encryptionMetadataCache
+                        );
+                }
+
             } catch (InterruptedException e) {
-                releaseHandles(result, blockIndex);
+                releaseHandles(result, actualBlockCount);
                 Thread.currentThread().interrupt();
                 throw new IOException("Interrupted while acquiring pool segment", e);
             } catch (IOException e) {
-                releaseHandles(result, blockIndex);
+                releaseHandles(result, actualBlockCount);
                 throw e;
             }
 
