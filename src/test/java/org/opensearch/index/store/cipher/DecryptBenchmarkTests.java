@@ -9,21 +9,11 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.security.SecureRandom;
 import java.util.Arrays;
-import java.util.Collection;
-import java.util.concurrent.TimeUnit;
 
 import javax.crypto.Cipher;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
-import org.openjdk.jmh.annotations.*;
-import org.openjdk.jmh.infra.Blackhole;
-import org.openjdk.jmh.results.RunResult;
-import org.openjdk.jmh.results.format.ResultFormatType;
-import org.openjdk.jmh.runner.Runner;
-import org.openjdk.jmh.runner.options.Options;
-import org.openjdk.jmh.runner.options.OptionsBuilder;
-import org.openjdk.jmh.runner.options.TimeValue;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -57,17 +47,19 @@ public class DecryptBenchmarkTests extends OpenSearchTestCase {
         StringBuilder sb = new StringBuilder();
         sb.append("\n\nDecrypt Benchmark: InPlace+Copy vs BulkChunkedDst (with GC measurement)\n");
         sb.append("=".repeat(90)).append("\n");
-        sb.append(
-            String.format(
-                "%-8s %15s %15s %10s %20s %20s%n",
-                "Blocks",
-                "InPlace+Copy",
-                "BulkChunked",
-                "Speedup",
-                "InPlace Alloc/op",
-                "Bulk Alloc/op"
-            )
-        );
+        sb
+            .append(
+                String
+                    .format(
+                        "%-8s %15s %15s %10s %20s %20s%n",
+                        "Blocks",
+                        "InPlace+Copy",
+                        "BulkChunked",
+                        "Speedup",
+                        "InPlace Alloc/op",
+                        "Bulk Alloc/op"
+                    )
+            );
         sb.append("-".repeat(90)).append("\n");
 
         for (int blockCount : blockCounts) {
@@ -112,17 +104,19 @@ public class DecryptBenchmarkTests extends OpenSearchTestCase {
             double bulkAvgUs = bulkNs / (double) measuredIters / 1000.0;
             double speedup = inPlaceAvgUs / bulkAvgUs;
 
-            sb.append(
-                String.format(
-                    "%-8d %12.1f us %12.1f us %9.2fx %17d B %17d B%n",
-                    blockCount,
-                    inPlaceAvgUs,
-                    bulkAvgUs,
-                    speedup,
-                    inPlaceAllocPerOp,
-                    bulkAllocPerOp
-                )
-            );
+            sb
+                .append(
+                    String
+                        .format(
+                            "%-8d %12.1f us %12.1f us %9.2fx %17d B %17d B%n",
+                            blockCount,
+                            inPlaceAvgUs,
+                            bulkAvgUs,
+                            speedup,
+                            inPlaceAllocPerOp,
+                            bulkAllocPerOp
+                        )
+                );
         }
         sb.append("\n");
         logger.info(sb.toString());

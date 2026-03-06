@@ -393,6 +393,224 @@ public class MemorySegmentDecryptorTests extends OpenSearchTestCase {
         assertArrayEquals("Source buffer should be unmodified", encrypted, srcAfter);
     }
 
+    /**
+     * Encrypts data frame-by-frame using per-frame IVs, matching the write path.
+     * Each frame gets its own IV derived from directoryKey + messageId + frameNumber.
+     */
+    private byte[] encryptFrameBased(
+        byte[] plaintext,
+        byte[] fileKey,
+        byte[] directoryKey,
+        byte[] messageId,
+        long frameSize,
+        long fileOffset,
+        String filePath,
+        EncryptionMetadataCache cache
+    ) throws Exception {
+        byte[] result = new byte[plaintext.length];
+        long remaining = plaintext.length;
+        long currentOffset = fileOffset;
+        int bufferOffset = 0;
+
+        while (remaining > 0) {
+            long frameNumber = currentOffset / frameSize;
+            long frameStart = frameNumber * frameSize;
+            long frameEnd = frameStart + frameSize;
+            long offsetWithinFrame = currentOffset - frameStart;
+            int bytesInFrame = (int) Math.min(remaining, frameEnd - currentOffset);
+
+            byte[] frameIV = AesCipherFactory.computeFrameIV(directoryKey, messageId, frameNumber, offsetWithinFrame, filePath, cache);
+            byte[] offsetIV = AesCipherFactory.computeOffsetIVForAesGcmEncrypted(frameIV, offsetWithinFrame);
+
+            Cipher cipher = AesCipherFactory.CIPHER_POOL.get();
+            cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(fileKey, "AES"), new IvParameterSpec(offsetIV));
+
+            int skip = (int) (offsetWithinFrame & ((1 << AesCipherFactory.AES_BLOCK_SIZE_BYTES_IN_POWER) - 1));
+            if (skip > 0) {
+                cipher.update(new byte[skip]);
+            }
+
+            byte[] encrypted = cipher.update(plaintext, bufferOffset, bytesInFrame);
+            System.arraycopy(encrypted, 0, result, bufferOffset, bytesInFrame);
+
+            currentOffset += bytesInFrame;
+            bufferOffset += bytesInFrame;
+            remaining -= bytesInFrame;
+        }
+        return result;
+    }
+
+    public void testDecryptToDestinationFrameBasedMultiFrame() throws Exception {
+        // Use a small frame size (64 bytes) to force multi-frame decryption
+        long frameSize = 64;
+        int dataSize = 200; // spans 4 frames: [0-63], [64-127], [128-191], [192-199]
+        byte[] directoryKey = new byte[32];
+        byte[] messageId = new byte[16];
+        Arrays.fill(directoryKey, (byte) 0xDD);
+        Arrays.fill(messageId, (byte) 0xEE);
+        String filePath = "/test/multiframe";
+        EncryptionMetadataCache cache = new EncryptionMetadataCache();
+        byte[] fileKey = TEST_KEY;
+
+        byte[] plaintext = new byte[dataSize];
+        new SecureRandom().nextBytes(plaintext);
+
+        byte[] encrypted = encryptFrameBased(plaintext, fileKey, directoryKey, messageId, frameSize, 0, filePath, cache);
+
+        // Decrypt using decryptToDestinationFrameBased
+        MemorySegment srcSeg = arena.allocate(encrypted.length);
+        MemorySegment dstSeg = arena.allocate(encrypted.length);
+        MemorySegment.copy(encrypted, 0, srcSeg, ValueLayout.JAVA_BYTE, 0, encrypted.length);
+
+        MemorySegmentDecryptor
+            .decryptToDestinationFrameBased(
+                srcSeg.address(),
+                dstSeg.address(),
+                dataSize,
+                fileKey,
+                directoryKey,
+                messageId,
+                frameSize,
+                0,
+                filePath,
+                cache
+            );
+
+        byte[] decrypted = new byte[dataSize];
+        for (int i = 0; i < dataSize; i++) {
+            decrypted[i] = dstSeg.get(ValueLayout.JAVA_BYTE, i);
+        }
+        assertArrayEquals("Multi-frame decryptToDestinationFrameBased failed", plaintext, decrypted);
+    }
+
+    public void testDecryptToDestinationFrameBasedMultiFrameWithOffset() throws Exception {
+        // Start at an offset that's mid-frame to exercise the slow path from the first byte
+        long frameSize = 64;
+        long fileOffset = 50; // starts in frame 0, 14 bytes from frame end
+        int dataSize = 100;   // spans frames 0 and 1
+        byte[] directoryKey = new byte[32];
+        byte[] messageId = new byte[16];
+        Arrays.fill(directoryKey, (byte) 0xAA);
+        Arrays.fill(messageId, (byte) 0xBB);
+        String filePath = "/test/multiframe_offset";
+        EncryptionMetadataCache cache = new EncryptionMetadataCache();
+        byte[] fileKey = TEST_KEY;
+
+        byte[] plaintext = new byte[dataSize];
+        new SecureRandom().nextBytes(plaintext);
+
+        byte[] encrypted = encryptFrameBased(plaintext, fileKey, directoryKey, messageId, frameSize, fileOffset, filePath, cache);
+
+        MemorySegment srcSeg = arena.allocate(encrypted.length);
+        MemorySegment dstSeg = arena.allocate(encrypted.length);
+        MemorySegment.copy(encrypted, 0, srcSeg, ValueLayout.JAVA_BYTE, 0, encrypted.length);
+
+        MemorySegmentDecryptor
+            .decryptToDestinationFrameBased(
+                srcSeg.address(),
+                dstSeg.address(),
+                dataSize,
+                fileKey,
+                directoryKey,
+                messageId,
+                frameSize,
+                fileOffset,
+                filePath,
+                cache
+            );
+
+        byte[] decrypted = new byte[dataSize];
+        for (int i = 0; i < dataSize; i++) {
+            decrypted[i] = dstSeg.get(ValueLayout.JAVA_BYTE, i);
+        }
+        assertArrayEquals("Multi-frame decryptToDestinationFrameBased with offset failed", plaintext, decrypted);
+    }
+
+    public void testDecryptInPlaceFrameBasedMultiFrame() throws Exception {
+        long frameSize = 64;
+        int dataSize = 200;
+        byte[] directoryKey = new byte[32];
+        byte[] messageId = new byte[16];
+        Arrays.fill(directoryKey, (byte) 0xCC);
+        Arrays.fill(messageId, (byte) 0xFF);
+        String filePath = "/test/inplace_multiframe";
+        EncryptionMetadataCache cache = new EncryptionMetadataCache();
+        byte[] fileKey = TEST_KEY;
+
+        byte[] plaintext = new byte[dataSize];
+        new SecureRandom().nextBytes(plaintext);
+
+        byte[] encrypted = encryptFrameBased(plaintext, fileKey, directoryKey, messageId, frameSize, 0, filePath, cache);
+
+        MemorySegment seg = arena.allocate(encrypted.length);
+        MemorySegment.copy(encrypted, 0, seg, ValueLayout.JAVA_BYTE, 0, encrypted.length);
+
+        MemorySegmentDecryptor
+            .decryptInPlaceFrameBased(seg.address(), dataSize, fileKey, directoryKey, messageId, frameSize, 0, filePath, cache);
+
+        byte[] decrypted = new byte[dataSize];
+        for (int i = 0; i < dataSize; i++) {
+            decrypted[i] = seg.get(ValueLayout.JAVA_BYTE, i);
+        }
+        assertArrayEquals("Multi-frame decryptInPlaceFrameBased failed", plaintext, decrypted);
+    }
+
+    public void testDecryptToChunkedDestinationsFrameBasedMultiFrame() throws Exception {
+        // Test the chunked destinations variant across frame boundaries
+        long frameSize = 64;
+        int chunkSize = 32;
+        int chunkCount = 7; // 7 * 32 = 224 bytes, spans 4 frames
+        int totalSize = chunkSize * chunkCount;
+        byte[] directoryKey = new byte[32];
+        byte[] messageId = new byte[16];
+        Arrays.fill(directoryKey, (byte) 0x11);
+        Arrays.fill(messageId, (byte) 0x22);
+        String filePath = "/test/chunked_multiframe";
+        EncryptionMetadataCache cache = new EncryptionMetadataCache();
+        byte[] fileKey = TEST_KEY;
+
+        byte[] plaintext = new byte[totalSize];
+        new SecureRandom().nextBytes(plaintext);
+
+        byte[] encrypted = encryptFrameBased(plaintext, fileKey, directoryKey, messageId, frameSize, 0, filePath, cache);
+
+        MemorySegment srcSeg = arena.allocate(encrypted.length);
+        MemorySegment.copy(encrypted, 0, srcSeg, ValueLayout.JAVA_BYTE, 0, encrypted.length);
+
+        long[] dstAddrs = new long[chunkCount];
+        int[] chunkSizes = new int[chunkCount];
+        MemorySegment[] dstSegs = new MemorySegment[chunkCount];
+        for (int i = 0; i < chunkCount; i++) {
+            dstSegs[i] = arena.allocate(chunkSize);
+            dstAddrs[i] = dstSegs[i].address();
+            chunkSizes[i] = chunkSize;
+        }
+
+        MemorySegmentDecryptor
+            .decryptToChunkedDestinationsFrameBased(
+                srcSeg.address(),
+                dstAddrs,
+                chunkSizes,
+                chunkCount,
+                fileKey,
+                directoryKey,
+                messageId,
+                frameSize,
+                0,
+                filePath,
+                cache
+            );
+
+        // Reassemble and verify
+        byte[] decrypted = new byte[totalSize];
+        for (int i = 0; i < chunkCount; i++) {
+            for (int j = 0; j < chunkSize; j++) {
+                decrypted[i * chunkSize + j] = dstSegs[i].get(ValueLayout.JAVA_BYTE, j);
+            }
+        }
+        assertArrayEquals("Multi-frame decryptToChunkedDestinationsFrameBased failed", plaintext, decrypted);
+    }
+
     public void testChunkedDecryption() throws Exception {
         // Test that chunked processing works correctly
         int dataSize = 20000; // Larger than default chunk size

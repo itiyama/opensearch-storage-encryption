@@ -154,9 +154,12 @@ public class CryptoDirectIOBlockLoader implements BlockLoader<RefCountedMemorySe
                 releaseHandles(result, actualBlockCount);
                 Thread.currentThread().interrupt();
                 throw new IOException("Interrupted while acquiring pool segment", e);
-            } catch (IOException e) {
+            } catch (Exception e) {
                 releaseHandles(result, actualBlockCount);
-                throw e;
+                if (e instanceof IOException) {
+                    throw (IOException) e;
+                }
+                throw new IOException("Decryption failed", e);
             }
 
             return result;
