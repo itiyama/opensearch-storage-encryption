@@ -172,13 +172,19 @@ public class CryptoDirectIOBlockLoader implements BlockLoader<RefCountedMemorySe
         }
     }
 
-    private void releaseHandles(RefCountedMemorySegment[] handles, int upTo) {
+    // Package-private for testing
+    void releaseHandles(RefCountedMemorySegment[] handles, int upTo) {
         for (int i = 0; i < upTo; i++) {
             if (handles[i] != null) {
-                // Zero out plaintext/partial-plaintext before returning segment to pool
-                handles[i].segment().fill((byte) 0);
-                handles[i].close();
-                handles[i] = null;
+                try {
+                    // Zero out plaintext/partial-plaintext before returning segment to pool
+                    handles[i].segment().fill((byte) 0);
+                } catch (Exception e) {
+                    LOGGER.warn("Failed to zero segment before release", e);
+                } finally {
+                    handles[i].close();
+                    handles[i] = null;
+                }
             }
         }
     }
