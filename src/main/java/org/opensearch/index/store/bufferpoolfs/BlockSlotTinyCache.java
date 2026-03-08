@@ -72,6 +72,18 @@ import org.opensearch.index.store.block_cache.FileBlockCacheKey;
  */
 public class BlockSlotTinyCache {
 
+    // Set once during node startup (createComponents), before any directory is created.
+    // Safe without volatile: createComponents() happens-before any shard creation thread.
+    private static boolean l1Enabled = true;
+
+    public static void setL1Enabled(boolean enabled) {
+        l1Enabled = enabled;
+    }
+
+    public static boolean isL1Enabled() {
+        return l1Enabled;
+    }
+
     public static final class CacheHitHolder {
         private boolean wasCacheHit;
 
@@ -155,24 +167,26 @@ public class BlockSlotTinyCache {
         final long blockIdx = blockOff >>> CACHE_BLOCK_SIZE_POWER;
         final int slotIdx = (int) ((blockIdx ^ (blockIdx >>> 17)) & SLOT_MASK);
 
-        // Acquire-load stamp FIRST (publication gate)
-        final long stamp = (long) STAMP_ARR.getAcquire(slotStamp, slotIdx);
-        if (stamp != 0L) {
-            final int wantHash = hashBlockIdx(blockIdx);
-            final int gotHash = (int) stamp;
-            if (gotHash == wantHash) {
-                // Safe to read published fields after matching stamp
-                if (slotBlockIdx[slotIdx] == blockIdx) {
-                    final BlockCacheValue<RefCountedMemorySegment> v = slotVal[slotIdx];
-                    if (v != null) {
-                        final int expectedGen = (int) (stamp >>> 32);
-                        if (v.tryPin()) {
-                            if (v.value().getGeneration() == expectedGen) {
-                                if (hitHolder != null)
-                                    hitHolder.setWasCacheHit(true);
-                                return v;
+        if (l1Enabled) {
+            // Acquire-load stamp FIRST (publication gate)
+            final long stamp = (long) STAMP_ARR.getAcquire(slotStamp, slotIdx);
+            if (stamp != 0L) {
+                final int wantHash = hashBlockIdx(blockIdx);
+                final int gotHash = (int) stamp;
+                if (gotHash == wantHash) {
+                    // Safe to read published fields after matching stamp
+                    if (slotBlockIdx[slotIdx] == blockIdx) {
+                        final BlockCacheValue<RefCountedMemorySegment> v = slotVal[slotIdx];
+                        if (v != null) {
+                            final int expectedGen = (int) (stamp >>> 32);
+                            if (v.tryPin()) {
+                                if (v.value().getGeneration() == expectedGen) {
+                                    if (hitHolder != null)
+                                        hitHolder.setWasCacheHit(true);
+                                    return v;
+                                }
+                                v.unpin();
                             }
-                            v.unpin();
                         }
                     }
                 }
@@ -194,7 +208,9 @@ public class BlockSlotTinyCache {
                 final int expectedGen = v.value().getGeneration();
                 if (v.tryPin()) {
                     if (v.value().getGeneration() == expectedGen) {
-                        publishToL1(slotIdx, blockIdx, v, expectedGen);
+                        if (l1Enabled) {
+                            publishToL1(slotIdx, blockIdx, v, expectedGen);
+                        }
                         if (hitHolder != null)
                             hitHolder.setWasCacheHit(true);
                         return v;
@@ -209,7 +225,9 @@ public class BlockSlotTinyCache {
                 final int expectedGen = loaded.value().getGeneration();
                 if (loaded.tryPin()) {
                     if (loaded.value().getGeneration() == expectedGen) {
-                        publishToL1(slotIdx, blockIdx, loaded, expectedGen);
+                        if (l1Enabled) {
+                            publishToL1(slotIdx, blockIdx, loaded, expectedGen);
+                        }
                         if (hitHolder != null)
                             hitHolder.setWasCacheHit(false);
                         return loaded;

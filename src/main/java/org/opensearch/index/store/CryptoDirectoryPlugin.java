@@ -35,6 +35,7 @@ import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.store.action.GetIndexCountForKeyAction;
 import org.opensearch.index.store.action.TransportGetIndexCountForKeyAction;
 import org.opensearch.index.store.block_cache.BlockCache;
+import org.opensearch.index.store.bufferpoolfs.BlockSlotTinyCache;
 import org.opensearch.index.store.key.MasterKeyHealthMonitor;
 import org.opensearch.index.store.key.NodeLevelKeyCache;
 import org.opensearch.index.store.key.ShardKeyResolverRegistry;
@@ -76,6 +77,14 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
      */
     public static final Setting<Boolean> CRYPTO_PLUGIN_ENABLED_SETTING = Setting
         .boolSetting(CRYPTO_PLUGIN_ENABLED, false, Setting.Property.NodeScope, Setting.Property.Filtered, Setting.Property.Final);
+
+    /**
+     * Dynamic cluster setting to enable/disable the L1 (BlockSlotTinyCache) cache layer in the buffer pool.
+     * When disabled, all reads go directly to the L2 Caffeine cache, bypassing the per-file 32-slot direct-mapped cache.
+     * Default: true (L1 cache enabled).
+     */
+    public static final Setting<Boolean> L1_CACHE_ENABLED_SETTING = Setting
+        .boolSetting("node.store.crypto.l1_cache_enabled", true, Setting.Property.NodeScope);
 
     private NodeEnvironment nodeEnvironment;
     private final boolean enabled;
@@ -137,6 +146,7 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
         List<Setting<?>> settings = Arrays
             .asList(
                 CRYPTO_PLUGIN_ENABLED_SETTING,
+                L1_CACHE_ENABLED_SETTING,
                 CryptoDirectoryFactory.INDEX_KEY_PROVIDER_SETTING,
                 CryptoDirectoryFactory.INDEX_KMS_ARN_SETTING,
                 CryptoDirectoryFactory.INDEX_KMS_ENC_CTX_SETTING,
@@ -208,6 +218,9 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
 
         // Set cluster service for accessing cluster metadata (e.g., repository settings)
         CryptoDirectoryFactory.setClusterService(clusterService);
+
+        // Initialize L1 cache setting from node config (static, does not change after startup)
+        BlockSlotTinyCache.setL1Enabled(L1_CACHE_ENABLED_SETTING.get(environment.settings()));
 
         // Initialize health monitor first (creates monitor)
         MasterKeyHealthMonitor.initialize(environment.settings(), client, clusterService);
