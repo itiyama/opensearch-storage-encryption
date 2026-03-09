@@ -218,8 +218,11 @@ spotless {
 }
 
 jmh {
+    fork = 3
     warmupIterations = 5
     iterations = 10
-    fork = 3
-    jvmArgs = ['--enable-preview', '--enable-native-access=ALL-UNNAMED']
+    jvmArgs = ['--enable-preview', '--enable-native-access=ALL-UNNAMED', '-XX:+UseZGC']
+    resultFormat = 'JSON'
+    resultsFile = project.file("${project.buildDir}/reports/jmh/results.json")
+    duplicateClassesStrategy = DuplicatesStrategy.WARN
 }
