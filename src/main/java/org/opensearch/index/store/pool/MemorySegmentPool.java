@@ -180,16 +180,17 @@ public class MemorySegmentPool implements Pool<RefCountedMemorySegment>, AutoClo
 
     @Override
     public void release(RefCountedMemorySegment refSegment) {
+        // Zero outside lock — safe because the segment's refcount is 0,
+        // so no other thread has access. This avoids holding the pool lock
+        // during the ~200ns memset, reducing contention under concurrent eviction.
+        if (requiresZeroing) {
+            refSegment.segment().fill((byte) 0);
+        }
         lock.lock();
         try {
             if (closed) {
-                // Free directly if pool is closed
                 PanamaNativeAccess.free(refSegment.segment());
                 return;
-            }
-
-            if (requiresZeroing) {
-                refSegment.segment().fill((byte) 0);
             }
 
             freeList.addLast(refSegment);
@@ -208,6 +209,13 @@ public class MemorySegmentPool implements Pool<RefCountedMemorySegment>, AutoClo
     public void releaseAll(RefCountedMemorySegment... segments) {
         if (segments.length == 0)
             return;
+        // Zero outside lock — safe because each segment's refcount is 0,
+        // so no other thread has access. Avoids holding the pool lock during zeroing.
+        if (requiresZeroing) {
+            for (RefCountedMemorySegment s : segments) {
+                s.segment().fill((byte) 0);
+            }
+        }
         lock.lock();
         try {
             if (closed) {
@@ -218,9 +226,6 @@ public class MemorySegmentPool implements Pool<RefCountedMemorySegment>, AutoClo
             }
 
             for (RefCountedMemorySegment s : segments) {
-                if (requiresZeroing) {
-                    s.segment().fill((byte) 0);
-                }
                 freeList.addLast(s);
             }
             cachedFreeListSize = freeList.size();
