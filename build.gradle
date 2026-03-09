@@ -216,3 +216,10 @@ spotless {
         eclipse().configFile rootProject.file('.eclipseformat.xml')
     }
 }
+
+jmh {
+    warmupIterations = 5
+    iterations = 10
+    fork = 3
+    jvmArgs = ['--enable-preview', '--enable-native-access=ALL-UNNAMED']
+}
