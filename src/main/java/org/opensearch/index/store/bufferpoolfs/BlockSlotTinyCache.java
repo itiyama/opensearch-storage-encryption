@@ -166,13 +166,10 @@ public class BlockSlotTinyCache {
                     final BlockCacheValue<RefCountedMemorySegment> v = slotVal[slotIdx];
                     if (v != null) {
                         final int expectedGen = (int) (stamp >>> 32);
-                        if (v.tryPin()) {
-                            if (v.value().getGeneration() == expectedGen) {
-                                if (hitHolder != null)
-                                    hitHolder.setWasCacheHit(true);
-                                return v;
-                            }
-                            v.unpin();
+                        if (v.value().tryPinIfGeneration(expectedGen)) {
+                            if (hitHolder != null)
+                                hitHolder.setWasCacheHit(true);
+                            return v;
                         }
                     }
                 }
@@ -192,14 +189,11 @@ public class BlockSlotTinyCache {
             BlockCacheValue<RefCountedMemorySegment> v = cache.get(key);
             if (v != null) {
                 final int expectedGen = v.value().getGeneration();
-                if (v.tryPin()) {
-                    if (v.value().getGeneration() == expectedGen) {
-                        publishToL1(slotIdx, blockIdx, v, expectedGen);
-                        if (hitHolder != null)
-                            hitHolder.setWasCacheHit(true);
-                        return v;
-                    }
-                    v.unpin(); // pinned recycled object; treat as miss
+                if (v.value().tryPinIfGeneration(expectedGen)) {
+                    publishToL1(slotIdx, blockIdx, v, expectedGen);
+                    if (hitHolder != null)
+                        hitHolder.setWasCacheHit(true);
+                    return v;
                 }
             }
 
@@ -207,14 +201,11 @@ public class BlockSlotTinyCache {
             BlockCacheValue<RefCountedMemorySegment> loaded = cache.getOrLoad(key);
             if (loaded != null) {
                 final int expectedGen = loaded.value().getGeneration();
-                if (loaded.tryPin()) {
-                    if (loaded.value().getGeneration() == expectedGen) {
-                        publishToL1(slotIdx, blockIdx, loaded, expectedGen);
-                        if (hitHolder != null)
-                            hitHolder.setWasCacheHit(false);
-                        return loaded;
-                    }
-                    loaded.unpin();
+                if (loaded.value().tryPinIfGeneration(expectedGen)) {
+                    publishToL1(slotIdx, blockIdx, loaded, expectedGen);
+                    if (hitHolder != null)
+                        hitHolder.setWasCacheHit(false);
+                    return loaded;
                 }
             }
 

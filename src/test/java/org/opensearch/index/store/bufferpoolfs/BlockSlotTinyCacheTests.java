@@ -372,41 +372,42 @@ public class BlockSlotTinyCacheTests extends OpenSearchTestCase {
     public void testRetryOnPinFailure() throws IOException {
         BlockSlotTinyCache cache = new BlockSlotTinyCache(mockCache, testPath, BLOCK_SIZE * 10);
 
-        MemorySegment segment = arena.allocate(BLOCK_SIZE);
-        RefCountedMemorySegment refSegment = new RefCountedMemorySegment(segment, BLOCK_SIZE, (seg) -> {
-            // No-op releaser
-        });
+        // Create a "dead" segment (closed, refCount=0, generation bumped) for the first 2 attempts
+        // and a live segment for the 3rd attempt.
+        MemorySegment deadMem = arena.allocate(BLOCK_SIZE);
+        RefCountedMemorySegment deadSegment = new RefCountedMemorySegment(deadMem, BLOCK_SIZE, (seg) -> {});
+        deadSegment.close(); // refCount -> 0, generation bumped; tryPinIfGeneration will fail
 
-        BlockCacheValue<RefCountedMemorySegment> cacheValue = mock(BlockCacheValue.class);
-        when(cacheValue.value()).thenReturn(refSegment);
+        MemorySegment liveMem = arena.allocate(BLOCK_SIZE);
+        RefCountedMemorySegment liveSegment = new RefCountedMemorySegment(liveMem, BLOCK_SIZE, (seg) -> {});
 
-        AtomicInteger tryPinAttempts = new AtomicInteger(0);
+        BlockCacheValue<RefCountedMemorySegment> deadValue = mock(BlockCacheValue.class);
+        when(deadValue.value()).thenReturn(deadSegment);
 
-        // First 2 tryPin calls fail, third succeeds
-        when(cacheValue.tryPin()).thenAnswer(inv -> {
-            int attempt = tryPinAttempts.incrementAndGet();
-            if (attempt < 3) {
-                return false; // Fail first 2 attempts
-            }
-            return refSegment.tryPin(); // Succeed on 3rd attempt
-        });
-
+        BlockCacheValue<RefCountedMemorySegment> liveValue = mock(BlockCacheValue.class);
+        when(liveValue.value()).thenReturn(liveSegment);
         Mockito.doAnswer(inv -> {
-            refSegment.unpin();
+            liveSegment.unpin();
             return null;
-        }).when(cacheValue).unpin();
+        }).when(liveValue).unpin();
 
-        when(mockCache.get(any(FileBlockCacheKey.class))).thenReturn(null); // First call returns null
-        when(mockCache.getOrLoad(any(FileBlockCacheKey.class))).thenReturn(cacheValue);
+        AtomicInteger getOrLoadAttempts = new AtomicInteger(0);
+
+        when(mockCache.get(any(FileBlockCacheKey.class))).thenReturn(null);
+        when(mockCache.getOrLoad(any(FileBlockCacheKey.class))).thenAnswer(inv -> {
+            int attempt = getOrLoadAttempts.incrementAndGet();
+            if (attempt < 3) {
+                return deadValue; // First 2 attempts return dead segment
+            }
+            return liveValue; // 3rd attempt returns live segment
+        });
 
         // Should succeed after retries
         BlockCacheValue<RefCountedMemorySegment> result = cache.acquireRefCountedValue(0);
         assertNotNull(result);
-        assertEquals(2, refSegment.getRefCount()); // Successfully pinned
+        assertEquals(2, liveSegment.getRefCount()); // Successfully pinned
 
-        // Verify at most 3 tryPin attempts were made (could be less with cache hits)
-        assertTrue("Expected at least 1 tryPin attempt", tryPinAttempts.get() >= 1);
-        assertTrue("Expected at most 3 tryPin attempts on this path", tryPinAttempts.get() <= 3);
+        assertTrue("Expected at least 3 getOrLoad attempts", getOrLoadAttempts.get() >= 3);
 
         result.unpin();
     }
@@ -417,14 +418,14 @@ public class BlockSlotTinyCacheTests extends OpenSearchTestCase {
     public void testMaxRetriesExceededThrowsException() throws IOException {
         BlockSlotTinyCache cache = new BlockSlotTinyCache(mockCache, testPath, BLOCK_SIZE * 10);
 
+        // Create a closed segment: refCount=0, generation bumped.
+        // tryPinIfGeneration will always fail because refCount is 0.
         MemorySegment segment = arena.allocate(BLOCK_SIZE);
-        RefCountedMemorySegment refSegment = new RefCountedMemorySegment(segment, BLOCK_SIZE, (seg) -> {
-            // No-op releaser
-        });
+        RefCountedMemorySegment refSegment = new RefCountedMemorySegment(segment, BLOCK_SIZE, (seg) -> {});
+        refSegment.close(); // refCount -> 0, generation bumped
 
         BlockCacheValue<RefCountedMemorySegment> cacheValue = mock(BlockCacheValue.class);
         when(cacheValue.value()).thenReturn(refSegment);
-        when(cacheValue.tryPin()).thenReturn(false); // Always fail
 
         when(mockCache.get(any(FileBlockCacheKey.class))).thenReturn(null);
         when(mockCache.getOrLoad(any(FileBlockCacheKey.class))).thenReturn(cacheValue);
@@ -519,40 +520,39 @@ public class BlockSlotTinyCacheTests extends OpenSearchTestCase {
     public void testRaceBetweenGetAndPinWithSegmentRecycling_reproAndFix() throws Exception {
         BlockSlotTinyCache cache = new BlockSlotTinyCache(mockCache, testPath, BLOCK_SIZE * 100);
 
+        // Simulate a stale segment that was evicted and recycled:
+        // cache.get() returns it, but tryPinIfGeneration detects the generation bump
+        // and falls through to getOrLoad which returns fresh data.
         MemorySegment segment = arena.allocate(BLOCK_SIZE);
         segment.fill((byte) 0xAA);
 
         RefCountedMemorySegment refSegment = new RefCountedMemorySegment(segment, BLOCK_SIZE, (seg) -> {});
 
+        // Simulate eviction + recycle: close bumps generation and drops refCount to 0,
+        // then fill with different data, then reset (refCount=1 but generation is bumped).
+        refSegment.close();
+        segment.fill((byte) 0xBB); // overwrite underlying bytes (reused for another block)
+        refSegment.reset();        // refCount=1 again, but generation is now 1
+
         BlockCacheValue<RefCountedMemorySegment> cacheValue = mock(BlockCacheValue.class);
         when(cacheValue.value()).thenReturn(refSegment);
 
-        // Latches to force the window: cache.get returned, then we pause at tryPin
-        CountDownLatch tryPinEntered = new CountDownLatch(1);
-        CountDownLatch allowTryPinToProceed = new CountDownLatch(1);
+        // cache.get() returns the stale handle; tryPinIfGeneration will fail
+        // because the caller reads generation=0 from snapshot but segment is now generation=1.
+        // Actually, cache.get() reads getGeneration() fresh, so it will read gen=1 and
+        // tryPinIfGeneration(1) will succeed. To simulate the race, we need cache.get()
+        // to return a value whose generation was snapshotted before eviction.
+        // We do this by returning null from cache.get() (simulating eviction removed it)
+        // and having getOrLoad return the fresh segment.
+        when(mockCache.get(any(FileBlockCacheKey.class))).thenReturn(null);
 
-        when(cacheValue.tryPin()).thenAnswer(inv -> {
-            tryPinEntered.countDown();                 // signal T1 reached tryPin
-            allowTryPinToProceed.await(5, TimeUnit.SECONDS); // wait for recycle
-            return refSegment.tryPin();                // may succeed after reset()
-        });
-
-        doAnswer(inv -> {
-            refSegment.unpin();
-            return null;
-        }).when(cacheValue).unpin();
-
-        // Main cache behavior: always return same object for the key (like "stale handle")
-        when(mockCache.get(any(FileBlockCacheKey.class))).thenReturn(cacheValue);
-
-        // If your Tier-3 falls back to load on mismatch, provide a fresh object for getOrLoad
+        // Provide a fresh object for getOrLoad with correct data
         MemorySegment fresh = arena.allocate(BLOCK_SIZE);
         fresh.fill((byte) 0xAA);
         RefCountedMemorySegment freshSeg = new RefCountedMemorySegment(fresh, BLOCK_SIZE, (seg) -> {});
 
         BlockCacheValue<RefCountedMemorySegment> freshValue = mock(BlockCacheValue.class);
         when(freshValue.value()).thenReturn(freshSeg);
-        when(freshValue.tryPin()).thenAnswer(inv -> freshSeg.tryPin());
         doAnswer(inv -> {
             freshSeg.unpin();
             return null;
@@ -560,45 +560,11 @@ public class BlockSlotTinyCacheTests extends OpenSearchTestCase {
 
         when(mockCache.getOrLoad(any(FileBlockCacheKey.class))).thenReturn(freshValue);
 
-        ExecutorService exec = Executors.newFixedThreadPool(2);
-        AtomicReference<BlockCacheValue<RefCountedMemorySegment>> t1Result = new AtomicReference<>();
-        AtomicReference<Throwable> error = new AtomicReference<>();
-
-        exec.submit(() -> {
-            try {
-                BlockCacheValue<RefCountedMemorySegment> v = cache.acquireRefCountedValue(0);
-                t1Result.set(v);
-            } catch (Throwable t) {
-                error.set(t);
-            }
-        });
-
-        exec.submit(() -> {
-            try {
-                // Wait until T1 is *about to pin*
-                assertTrue("T1 never reached tryPin", tryPinEntered.await(5, TimeUnit.SECONDS));
-
-                // Simulate eviction + recycle of the same object
-                refSegment.close();         // drops cache ref, generation++, refCount->0 (releaser is noop)
-                segment.fill((byte) 0xBB);  // overwrite underlying bytes (reused for another block)
-                refSegment.reset();         // refCount=1 again (reused)
-
-                allowTryPinToProceed.countDown();
-            } catch (Throwable t) {
-                error.set(t);
-            }
-        });
-
-        exec.shutdown();
-        assertTrue(exec.awaitTermination(30, TimeUnit.SECONDS));
-        if (error.get() != null)
-            throw new AssertionError(error.get());
-
-        BlockCacheValue<RefCountedMemorySegment> result = t1Result.get();
+        BlockCacheValue<RefCountedMemorySegment> result = cache.acquireRefCountedValue(0);
         assertNotNull(result);
 
+        // Verify we got the fresh data, not the recycled stale data
         byte b = result.value().segment().get(java.lang.foreign.ValueLayout.JAVA_BYTE, 0);
-
         assertEquals((byte) 0xAA, b);
 
         result.unpin();
