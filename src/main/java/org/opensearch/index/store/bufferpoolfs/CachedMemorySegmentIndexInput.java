@@ -309,7 +309,7 @@ public class CachedMemorySegmentIndexInput extends IndexInput implements RandomA
         if (length == 0)
             return;
 
-        final long startPos = getFilePointer();
+        final long startPos = curPosition;
         final long totalBytes = Integer.BYTES * (long) length;
 
         try {
@@ -344,7 +344,7 @@ public class CachedMemorySegmentIndexInput extends IndexInput implements RandomA
         if (length == 0)
             return;
 
-        final long startPos = getFilePointer();
+        final long startPos = curPosition;
         final long totalBytes = Long.BYTES * (long) length;
 
         try {
@@ -379,7 +379,7 @@ public class CachedMemorySegmentIndexInput extends IndexInput implements RandomA
         if (length == 0)
             return;
 
-        final long startPos = getFilePointer();
+        final long startPos = curPosition;
         final long totalBytes = Float.BYTES * (long) length;
 
         try {
@@ -411,7 +411,7 @@ public class CachedMemorySegmentIndexInput extends IndexInput implements RandomA
 
     @Override
     public final short readShort() throws IOException {
-        final long currentPos = getFilePointer();
+        final long currentPos = curPosition;
         try {
             final MemorySegment segment;
             final int offsetInBlock;
