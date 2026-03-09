@@ -175,7 +175,9 @@ public class CachedMemorySegmentIndexInput extends IndexInput implements RandomA
         // this access is safe without generation check because currentBlock
         // is pinned (refCount > 1) so it cannot be returned to pool or reused
         // for different data while we hold it.
-        if (blockOffset == currentBlockOffset && currentBlock != null) {
+        // currentBlockOffset is only set to a valid offset when currentBlock is assigned non-null,
+        // so equality with blockOffset (always >= 0) implies currentBlock != null.
+        if (blockOffset == currentBlockOffset) {
             lastOffsetInBlock = offsetInBlock;
             return currentBlock.value().segment();
         }
