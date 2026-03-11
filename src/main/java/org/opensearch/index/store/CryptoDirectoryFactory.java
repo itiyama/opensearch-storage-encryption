@@ -37,6 +37,7 @@ import org.opensearch.index.store.block_cache.CaffeineBlockCache;
 import org.opensearch.index.store.block_loader.BlockLoader;
 import org.opensearch.index.store.block_loader.CryptoDirectIOBlockLoader;
 import org.opensearch.index.store.bufferpoolfs.BufferPoolDirectory;
+import org.opensearch.index.store.bufferpoolfs.WriteCacheMode;
 import org.opensearch.index.store.cipher.EncryptionMetadataCache;
 import org.opensearch.index.store.cipher.EncryptionMetadataCacheRegistry;
 import org.opensearch.index.store.hybrid.HybridCryptoDirectory;
@@ -507,6 +508,8 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         // All shards/directories share a single queue and executor pool for better resource utilization
         Worker readaheadWorker = resources.getSharedReadaheadWorker();
 
+        WriteCacheMode writeCacheMode = WriteCacheMode.fromSettingValue(WriteCacheMode.NODE_WRITE_CACHE_MODE_SETTING.get(nodeSettings));
+
         return new BufferPoolDirectory(
             location,
             lockFactory,
@@ -516,7 +519,8 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
             directoryCache,
             loader,
             readaheadWorker,
-            encryptionMetadataCache
+            encryptionMetadataCache,
+            writeCacheMode
         );
     }
 

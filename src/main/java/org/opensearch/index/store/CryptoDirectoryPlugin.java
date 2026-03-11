@@ -35,6 +35,7 @@ import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.store.action.GetIndexCountForKeyAction;
 import org.opensearch.index.store.action.TransportGetIndexCountForKeyAction;
 import org.opensearch.index.store.block_cache.BlockCache;
+import org.opensearch.index.store.bufferpoolfs.WriteCacheMode;
 import org.opensearch.index.store.key.MasterKeyHealthMonitor;
 import org.opensearch.index.store.key.NodeLevelKeyCache;
 import org.opensearch.index.store.key.ShardKeyResolverRegistry;
@@ -144,7 +145,8 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
                 CryptoDirectoryFactory.NODE_KEY_EXPIRY_INTERVAL_SETTING,
                 PoolSizeCalculator.NODE_POOL_SIZE_PERCENTAGE_SETTING,
                 PoolSizeCalculator.NODE_CACHE_TO_POOL_RATIO_SETTING,
-                PoolSizeCalculator.NODE_WARMUP_PERCENTAGE_SETTING
+                PoolSizeCalculator.NODE_WARMUP_PERCENTAGE_SETTING,
+                WriteCacheMode.NODE_WRITE_CACHE_MODE_SETTING
             );
         return settings;
     }

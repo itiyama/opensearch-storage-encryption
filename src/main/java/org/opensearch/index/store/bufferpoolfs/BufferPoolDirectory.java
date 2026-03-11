@@ -80,8 +80,7 @@ public class BufferPoolDirectory extends FSDirectory {
 
     /**
      * Creates a new CryptoDirectIODirectory with the specified components.
-     * Write cache mode is resolved from {@code -Dtests.cacheMode} system property,
-     * defaulting to {@link WriteCacheMode#WRITE_THROUGH} when unset.
+     * Defaults to {@link WriteCacheMode#WRITE_THROUGH}.
      *
      * @param path the directory path
      * @param lockFactory the lock factory for coordinating access
@@ -116,7 +115,7 @@ public class BufferPoolDirectory extends FSDirectory {
             blockLoader,
             worker,
             encryptionMetadataCache,
-            WriteCacheMode.fromSystemProperty()
+            WriteCacheMode.WRITE_THROUGH
         );
     }
 
