@@ -162,6 +162,51 @@ cd "${STORAGE_ENCRYPTION_DIR}"
 ./gradlew yamlRestTest
 ```
 
+### Lucene Directory Injection Tests
+
+These tests run Lucene's own test suite against the encrypted directory implementations
+(`CryptoNIOFS`, `BufferPool`, `Hybrid`) to validate compatibility. Apache Lucene does not
+publish test classes as Maven artifacts, so a local Lucene source tree must be compiled first.
+
+**Prerequisites:**
+
+```bash
+# 1. Clone or locate a Lucene source tree (default: sibling ../lucene directory)
+# 2. Compile Lucene's core test classes
+cd ../lucene
+export JAVA_HOME=$(/usr/libexec/java_home -v 21)
+./gradlew -p lucene/core compileTestJava
+```
+
+**Running the tests:**
+
+```bash
+cd opensearch-storage-encryption
+export JAVA_HOME=$(/usr/libexec/java_home -v 21)
+
+# Run against a specific directory type
+./gradlew luceneCryptoNIOFSIntegTest
+./gradlew luceneBufferPoolIntegTest
+./gradlew luceneHybridIntegTest
+
+# Run all three
+./gradlew allLuceneIntegTests
+```
+
+**Custom Lucene location** (if your Lucene tree is not at `../lucene`):
+
+```bash
+./gradlew luceneHybridIntegTest -PluceneDir=/path/to/lucene
+```
+
+**Write cache mode** — by default, a random `WriteCacheMode` (`WRITE_THROUGH` or `READ_THROUGH`)
+is selected per build invocation. To force a specific mode:
+
+```bash
+./gradlew luceneHybridIntegTest -Ptests.cacheMode=READ_THROUGH
+./gradlew test -Ptests.cacheMode=WRITE_THROUGH
+```
+
 ## Debugging
 
 To debug the plugin:
@@ -359,6 +404,82 @@ logger.crypto.level = debug
 logger.key.name = org.opensearch.index.store.key
 logger.key.level = trace
 ```
+
+## IntelliJ IDEA Setup for Lucene Injection Tests
+
+Running and debugging the Lucene injection tests from IDEA requires extra setup because the
+test classes live in an external Lucene source tree (Lucene does not publish test-jars to Maven).
+
+### 1. Compile Lucene Test Classes and Import
+
+First, compile Lucene's core test classes:
+
+```bash
+cd ../lucene
+export JAVA_HOME=$(/usr/libexec/java_home -v 21)
+./gradlew -p lucene/core compileTestJava
+```
+
+Then open `opensearch-storage-encryption` in IDEA as a Gradle project. The Lucene test classes
+are already linked as a dependency via `build.gradle` (the `luceneCoreTestClasses` and
+`luceneCoreTestResources` entries). After Gradle sync, IDEA will resolve them automatically.
+
+If your Lucene tree is not at the default `../lucene` location, add this to your
+`gradle.properties` (project-level or `~/.gradle/gradle.properties`):
+
+```properties
+luceneDir=/path/to/lucene
+```
+
+### 2. Create a JUnit Run Configuration
+
+To run a specific Lucene test (e.g. `TestIndexWriter.testDocCount`) against an encrypted directory:
+
+1. **Run → Edit Configurations → + → JUnit**
+2. Configure the following:
+
+| Field | Value |
+|-------|-------|
+| **Name** | `Lucene Hybrid Injection - TestIndexWriter` |
+| **Module** | `opensearch-storage-encryption.test` |
+| **Test kind** | Class (or Method) |
+| **Class** | `org.apache.lucene.index.TestIndexWriter` |
+| **VM options** | see below |
+| **Working directory** | `$MODULE_DIR$` |
+
+**VM options** (paste as a single block):
+
+```
+--enable-native-access=ALL-UNNAMED
+-Dtests.directory=org.opensearch.index.store.TestableHybridCryptoDirectory
+-Dtests.security.manager=false
+-Dtests.cacheMode=WRITE_THROUGH
+-ea
+```
+
+Replace the `tests.directory` value for other directory types:
+- `org.opensearch.index.store.TestableBufferPoolDirectory`
+- `org.opensearch.index.store.TestableCryptoNIOFSDirectory`
+
+### 4. Debugging
+
+With the run configuration above, you can:
+
+- **Set breakpoints** in both the encryption plugin code (e.g. `BufferPoolDirectory.openInput`)
+  and Lucene test code (e.g. `TestIndexWriter`)
+- **Run → Debug** the configuration to hit breakpoints in either codebase
+- **Step through** the full write → encrypt → cache → read → decrypt flow
+
+### 5. Reproducing a Specific Failure
+
+Lucene's randomized testing framework uses seeds. To reproduce a specific failure, add
+the seed to VM options:
+
+```
+-Dtests.seed=DEADBEEF
+```
+
+The seed is printed in the Gradle test output and in the IDEA test runner output on every run.
 
 ### Getting Help
 

@@ -24,6 +24,7 @@ import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.LockFactory;
+import org.apache.lucene.store.NIOFSDirectory;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.index.store.block.RefCountedMemorySegment;
 import org.opensearch.index.store.block_cache.BlockCache;
@@ -76,9 +77,11 @@ public class BufferPoolDirectory extends FSDirectory {
     private final Path dirPath;
     private final byte[] masterKeyBytes;
     private final EncryptionMetadataCache encryptionMetadataCache;
+    private final NIOFSDirectory plainDelegate;
+    private final WriteCacheMode writeCacheMode;
 
     /**
-     * Creates a new CryptoDirectIODirectory with the specified components.
+     * Creates a new CryptoDirectIODirectory with the specified components and write cache mode.
      *
      * @param path the directory path
      * @param lockFactory the lock factory for coordinating access
@@ -88,6 +91,8 @@ public class BufferPoolDirectory extends FSDirectory {
      * @param blockCache cache for storing decrypted blocks
      * @param blockLoader loader for reading blocks from storage
      * @param worker background worker for read-ahead operations
+     * @param encryptionMetadataCache the encryption metadata cache
+     * @param writeCacheMode controls whether writes populate the block cache
      * @throws IOException if the directory cannot be created or accessed
      */
     public BufferPoolDirectory(
@@ -99,7 +104,8 @@ public class BufferPoolDirectory extends FSDirectory {
         BlockCache<RefCountedMemorySegment> blockCache,
         BlockLoader<RefCountedMemorySegment> blockLoader,
         Worker worker,
-        EncryptionMetadataCache encryptionMetadataCache
+        EncryptionMetadataCache encryptionMetadataCache,
+        WriteCacheMode writeCacheMode
     )
         throws IOException {
         super(path, lockFactory);
@@ -110,6 +116,8 @@ public class BufferPoolDirectory extends FSDirectory {
         this.dirPath = getDirectory();
         this.masterKeyBytes = keyResolver.getDataKey().getEncoded();
         this.encryptionMetadataCache = encryptionMetadataCache;
+        this.plainDelegate = new NIOFSDirectory(path, lockFactory);
+        this.writeCacheMode = writeCacheMode;
 
         // startCacheStatsTelemetry(); // uncomment for local testing
     }
@@ -117,17 +125,26 @@ public class BufferPoolDirectory extends FSDirectory {
     @Override
     public IndexInput openInput(String name, IOContext context) throws IOException {
         try {
+            if (name.contains("segments_") || name.endsWith(".si")) {
+                return plainDelegate.openInput(name, context);
+            }
+
             ensureOpen();
             ensureCanRead(name);
 
             Path file = dirPath.resolve(name);
             long rawFileSize = Files.size(file);
             if (rawFileSize == 0) {
-                throw new IOException("Cannot open empty file with DirectIO: " + file);
+                return plainDelegate.openInput(name, context);
             }
 
             // Calculate content length with OSEF validation
             long contentLength = calculateContentLengthWithValidation(file, rawFileSize);
+
+            // If content length equals raw file size, the file is not encrypted — delegate to plain NIO reads
+            if (contentLength == rawFileSize) {
+                return plainDelegate.openInput(name, context);
+            }
 
             ReadaheadManager readAheadManager = new ReadaheadManagerImpl(readAheadworker, blockCache);
             ReadaheadContext readAheadContext = readAheadManager.register(file, contentLength);
@@ -160,16 +177,7 @@ public class BufferPoolDirectory extends FSDirectory {
             Path path = directory.resolve(name);
             OutputStream fos = Files.newOutputStream(path, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);
 
-            return new BufferIOWithCaching(
-                name,
-                path,
-                fos,
-                masterKeyBytes,
-                this.memorySegmentPool,
-                this.blockCache,
-                this.provider,
-                this.encryptionMetadataCache
-            );
+            return createIndexOutput(name, path, fos);
         } catch (Exception e) {
             CryptoMetricsService.getInstance().recordError(ErrorType.INDEX_OUTPUT_ERROR);
             throw e;
@@ -187,6 +195,10 @@ public class BufferPoolDirectory extends FSDirectory {
         Path path = directory.resolve(name);
         OutputStream fos = Files.newOutputStream(path, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);
 
+        return createIndexOutput(name, path, fos);
+    }
+
+    private IndexOutput createIndexOutput(String name, Path path, OutputStream fos) throws IOException {
         return new BufferIOWithCaching(
             name,
             path,
@@ -195,7 +207,8 @@ public class BufferPoolDirectory extends FSDirectory {
             this.memorySegmentPool,
             this.blockCache,
             this.provider,
-            this.encryptionMetadataCache
+            this.encryptionMetadataCache,
+            this.writeCacheMode
         );
     }
 
@@ -206,6 +219,7 @@ public class BufferPoolDirectory extends FSDirectory {
     public synchronized void close() throws IOException {
         readAheadworker.close();
         encryptionMetadataCache.invalidateDirectory();
+        plainDelegate.close();
 
         // Invalidate all cache entries for this directory to prevent memory leaks
         // when the shard/index is closed or deleted

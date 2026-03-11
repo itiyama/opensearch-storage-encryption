@@ -8,6 +8,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -51,6 +52,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
     private byte[] testKey;
     private Path tempFile;
     private Arena arena;
+    private WriteCacheMode randomWriteCacheMode;
 
     @Before
     public void setUp() throws Exception {
@@ -67,6 +69,8 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
 
         tempFile = Files.createTempFile("test-buffer-io", ".dat");
         arena = Arena.ofAuto();
+        randomWriteCacheMode = randomFrom(WriteCacheMode.values());
+        logger.info("Using randomWriteCacheMode={}", randomWriteCacheMode);
     }
 
     @After
@@ -96,7 +100,8 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 mockPool,
                 mockCache,
                 provider,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                randomWriteCacheMode
             )
         ) {
             // Write small chunks that should be buffered
@@ -129,7 +134,8 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 mockPool,
                 mockCache,
                 provider,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                randomWriteCacheMode
             )
         ) {
             // Write data >= BUFFER_SIZE (should bypass buffering)
@@ -159,7 +165,8 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 mockPool,
                 mockCache,
                 provider,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                randomWriteCacheMode
             )
         ) {
             // Fill buffer to near capacity
@@ -192,7 +199,8 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 mockPool,
                 mockCache,
                 provider,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                randomWriteCacheMode
             )
         ) {
             // Write individual bytes
@@ -222,7 +230,8 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 mockPool,
                 mockCache,
                 provider,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                randomWriteCacheMode
             )
         ) {
             // Write exactly one cache block (8192 bytes)
@@ -231,8 +240,16 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
             output.writeBytes(fullBlock, fullBlock.length);
         }
 
-        // Verify that block was cached
-        verify(mockCache, atLeastOnce()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        // WRITE_THROUGH populates cache on write; READ_THROUGH does not
+        if (randomWriteCacheMode == WriteCacheMode.WRITE_THROUGH) {
+            if (randomWriteCacheMode == WriteCacheMode.WRITE_THROUGH) {
+            verify(mockCache, atLeastOnce()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        } else {
+            verify(mockCache, never()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        }
+        } else {
+            verify(mockCache, never()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        }
     }
 
     /**
@@ -253,7 +270,8 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 mockPool,
                 mockCache,
                 provider,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                randomWriteCacheMode
             )
         ) {
             // Write 5 complete cache blocks
@@ -265,7 +283,11 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
         }
 
         // Verify that blocks were cached (at least 5 times, possibly 6 with final partial)
-        verify(mockCache, atLeastOnce()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        if (randomWriteCacheMode == WriteCacheMode.WRITE_THROUGH) {
+            verify(mockCache, atLeastOnce()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        } else {
+            verify(mockCache, never()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        }
     }
 
     /**
@@ -286,7 +308,8 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 mockPool,
                 mockCache,
                 provider,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                randomWriteCacheMode
             )
         ) {
             // Write partial block (not aligned to 8KB)
@@ -296,7 +319,11 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
         }
 
         // Verify that final partial block was cached on close
-        verify(mockCache, atLeastOnce()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        if (randomWriteCacheMode == WriteCacheMode.WRITE_THROUGH) {
+            verify(mockCache, atLeastOnce()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        } else {
+            verify(mockCache, never()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        }
     }
 
     /**
@@ -317,7 +344,8 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 mockPool,
                 mockCache,
                 provider,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                randomWriteCacheMode
             )
         ) {
             // Write data that results in partial final block
@@ -327,7 +355,11 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
         }
 
         // Should cache both full block and final partial block
-        verify(mockCache, atLeastOnce()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        if (randomWriteCacheMode == WriteCacheMode.WRITE_THROUGH) {
+            verify(mockCache, atLeastOnce()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        } else {
+            verify(mockCache, never()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        }
     }
 
     /**
@@ -348,7 +380,8 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 mockPool,
                 mockCache,
                 provider,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                randomWriteCacheMode
             )
         ) {
             // Write unaligned data that spans multiple blocks
@@ -365,7 +398,11 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
             output.writeBytes(data3, data3.length);
         }
 
-        verify(mockCache, atLeastOnce()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        if (randomWriteCacheMode == WriteCacheMode.WRITE_THROUGH) {
+            verify(mockCache, atLeastOnce()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        } else {
+            verify(mockCache, never()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        }
     }
 
     /**
@@ -386,7 +423,8 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 mockPool,
                 mockCache,
                 provider,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                randomWriteCacheMode
             )
         ) {
             // Write data close to frame boundary
@@ -420,7 +458,8 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 mockPool,
                 mockCache,
                 provider,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                randomWriteCacheMode
             )
         ) {
             expectThrows(NullPointerException.class, () -> { output.writeBytes(null, 100); });
@@ -445,7 +484,8 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 mockPool,
                 mockCache,
                 provider,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                randomWriteCacheMode
             )
         ) {
             byte[] data = new byte[100];
@@ -479,7 +519,8 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 mockPool,
                 mockCache,
                 provider,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                randomWriteCacheMode
             )
         ) {
             byte[] data = new byte[100];
@@ -508,7 +549,8 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 mockPool,
                 mockCache,
                 provider,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                randomWriteCacheMode
             )
         ) {
             // Write full block - should not cache but should still encrypt and write
@@ -538,7 +580,8 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 mockPool,
                 mockCache,
                 provider,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                randomWriteCacheMode
             )
         ) {
             // Close without writing
@@ -566,7 +609,8 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 mockPool,
                 mockCache,
                 provider,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                randomWriteCacheMode
             )
         ) {
             // Write exactly 10 cache blocks
@@ -576,7 +620,11 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
             }
         }
 
-        verify(mockCache, atLeastOnce()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        if (randomWriteCacheMode == WriteCacheMode.WRITE_THROUGH) {
+            verify(mockCache, atLeastOnce()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        } else {
+            verify(mockCache, never()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
+        }
     }
 
     /**
@@ -597,7 +645,8 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 mockPool,
                 mockCache,
                 provider,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                randomWriteCacheMode
             )
         ) {
             // Write 10MB (spans multiple frames)

@@ -507,5 +507,6 @@ public final class QueuingWorker implements Worker {
         closed = true;
         queue.clear();
         inFlight.clear();
+        executor.shutdownNow();
     }
 }

@@ -85,6 +85,16 @@ configurations.all {
     }
 }
 
+// Resolve write cache mode: explicit -Ptests.cacheMode wins, otherwise randomize per build
+ext {
+    def modes = ['WRITE_THROUGH', 'READ_THROUGH']
+    resolvedCacheMode = project.hasProperty('tests.cacheMode')
+        ? project.property('tests.cacheMode')
+        : modes[new Random().nextInt(modes.size())]
+}
+logger.lifecycle("WriteCacheMode  : ${resolvedCacheMode}" +
+    (project.hasProperty('tests.cacheMode') ? ' (explicit)' : ' (randomized)'))
+
 test {
     useJUnit()
     testLogging {
@@ -93,6 +103,7 @@ test {
     }
     systemProperty 'tests.security.manager', 'false'
     systemProperty 'tests.jvm.argline', '--enable-native-access=ALL-UNNAMED'
+    systemProperty 'tests.cacheMode', resolvedCacheMode
     jvmArgs += [
         '--enable-native-access=ALL-UNNAMED'
     ]
@@ -101,6 +112,7 @@ test {
 tasks.named('internalClusterTest').configure {
     systemProperty 'tests.security.manager', 'false'
     systemProperty 'java.security.policy', 'test.policy'
+    systemProperty 'tests.cacheMode', resolvedCacheMode
     testLogging {
         events "passed", "skipped", "failed"
         showStandardStreams = true
@@ -205,4 +217,156 @@ spotless {
         licenseHeaderFile 'spotless.license.java'
         eclipse().configFile rootProject.file('.eclipseformat.xml')
     }
+}
+
+// ============================================================
+// Lucene Directory Injection Tests
+// Run Lucene's existing test suite against encrypted directories.
+//
+// Apache Lucene does not publish test classes as Maven artifacts
+// (no test-jar or tests classifier), so we must compile them
+// from a local Lucene source tree and reference the classes
+// directly from disk.
+//
+// Prerequisites:
+//   cd <luceneDir> && ./gradlew -p lucene/core compileTestJava
+//
+// Usage:
+//   ./gradlew luceneCryptoNIOFSIntegTest
+//   ./gradlew luceneBufferPoolIntegTest
+//   ./gradlew luceneHybridIntegTest
+//   ./gradlew allLuceneIntegTests
+//
+// Override Lucene location (default: ../lucene):
+//   ./gradlew luceneHybridIntegTest -PluceneDir=/path/to/lucene
+// ============================================================
+
+ext {
+    def luceneDir = project.hasProperty('luceneDir')
+        ? project.property('luceneDir')
+        : "${rootProject.projectDir}/../lucene"
+    luceneCoreTestClasses = file("${luceneDir}/lucene/core/build/classes/java/test")
+    luceneCoreTestResources = file("${luceneDir}/lucene/core/build/resources/test")
+}
+
+['CryptoNIOFS', 'BufferPool', 'Hybrid'].each { dirType ->
+    def classNameMap = ['CryptoNIOFS': 'CryptoNIOFS', 'BufferPool': 'BufferPool', 'Hybrid': 'HybridCrypto']
+    def fqcn = "org.opensearch.index.store.Testable${classNameMap[dirType]}Directory"
+
+    task "lucene${dirType}IntegTest"(type: Test) {
+        description = "Run Lucene core tests with ${fqcn}"
+        group = 'verification'
+
+        // Lucene's compiled test classes from the local fork
+        testClassesDirs = files(luceneCoreTestClasses)
+
+        // Classpath: Lucene test classes + test resources + Lucene test framework
+        //          + plugin main classes + plugin test classes (Testable* wrappers)
+        classpath = files(luceneCoreTestClasses, luceneCoreTestResources) +
+                    sourceSets.test.runtimeClasspath
+
+        systemProperty 'tests.directory', fqcn
+        systemProperty 'tests.security.manager', 'false'
+        systemProperty 'tests.jvm.argline', '--enable-native-access=ALL-UNNAMED'
+        systemProperty 'tests.cacheMode', resolvedCacheMode
+        jvmArgs += ['--enable-native-access=ALL-UNNAMED']
+
+        filter {
+            includeTestsMatching 'org.apache.lucene.store.*'
+            includeTestsMatching 'org.apache.lucene.index.*'
+            includeTestsMatching 'org.apache.lucene.search.*'
+            includeTestsMatching 'org.apache.lucene.codecs.*'
+            includeTestsMatching 'org.apache.lucene.document.*'
+            includeTestsMatching 'org.apache.lucene.util.*'
+            includeTestsMatching 'org.apache.lucene.analysis.*'
+            includeTestsMatching 'org.apache.lucene.TestExternalCodecs'
+            includeTestsMatching 'org.apache.lucene.TestSearch'
+            includeTestsMatching 'org.apache.lucene.TestSearchForDuplicates'
+            includeTestsMatching 'org.apache.lucene.TestMergeSchedulerExternal'
+
+            // Require multi-JVM fork (tests.jvm.argline) — not supported in this harness
+            excludeTestsMatching 'org.apache.lucene.codecs.TestCodecLoadingDeadlock'
+            excludeTestsMatching 'org.apache.lucene.store.TestStressLockFactories'
+
+            // Classpath difference: our classpath includes backward-codecs (pulled by OpenSearch),
+            // which registers read-only KnnVectorsFormats (e.g. Lucene94HnswVectorsFormat).
+            // Lucene core's own test classpath does not include backward-codecs.
+            // randomVectorFormat() may select these read-only formats, causing
+            // "Old codecs may only be used for reading" in testSameFieldDifferentFormats.
+            excludeTestsMatching 'org.apache.lucene.search.TestKnnByteVectorQuery.testSameFieldDifferentFormats'
+            excludeTestsMatching 'org.apache.lucene.search.TestKnnByteVectorQueryMMap.testSameFieldDifferentFormats'
+            excludeTestsMatching 'org.apache.lucene.search.TestKnnFloatVectorQuery.testSameFieldDifferentFormats'
+            excludeTestsMatching 'org.apache.lucene.search.TestPatienceByteVectorQuery.testSameFieldDifferentFormats'
+            excludeTestsMatching 'org.apache.lucene.search.TestPatienceFloatVectorQuery.testSameFieldDifferentFormats'
+            excludeTestsMatching 'org.apache.lucene.search.TestSeededKnnByteVectorQuery.testSameFieldDifferentFormats'
+            excludeTestsMatching 'org.apache.lucene.search.TestSeededKnnFloatVectorQuery.testSameFieldDifferentFormats'
+
+            // ── Category A: Block cache vs deleted files ──
+            // The block cache lazy-loads from disk asynchronously. Tests that deliberately
+            // delete files, simulate crashes, or race concurrent deletions trigger
+            // NoSuchFileException when the cache tries to read a file that no longer exists.
+            // See LUCENE_INJECTION_EXCLUSIONS.md §A for details.
+            excludeTestsMatching 'org.apache.lucene.index.TestCodecHoldsOpenFiles'
+            excludeTestsMatching 'org.apache.lucene.index.TestIndexWriterOutOfFileDescriptors'
+            excludeTestsMatching 'org.apache.lucene.index.TestAllFilesDetectTruncation'
+            excludeTestsMatching 'org.apache.lucene.index.TestMultiDocValues'
+            excludeTestsMatching 'org.apache.lucene.index.TestStressIndexing2'
+            excludeTestsMatching 'org.apache.lucene.index.TestIndexWriterCommit.testCommitThreadSafety'
+            excludeTestsMatching 'org.apache.lucene.search.TestPointQueries.testRandomLongsBig'
+            excludeTestsMatching 'org.apache.lucene.search.TestPointQueries.testRandomLongsMedium'
+            excludeTestsMatching 'org.apache.lucene.search.TestCustomSearcherSort'
+            excludeTestsMatching 'org.apache.lucene.search.TestPrefixInBooleanQuery'
+
+            // ── Category B: Crash/corruption simulation vs encryption footer ──
+            // MockDirectoryWrapper simulates crashes, truncation, and bit-flips.
+            // Encrypted files have an authentication footer (GCM tags); truncation or
+            // corruption causes "Footer authentication failed" or ClosedChannelException
+            // instead of the CorruptIndexException the tests expect.
+            // See LUCENE_INJECTION_EXCLUSIONS.md §B for details.
+            excludeTestsMatching 'org.apache.lucene.index.TestCrashCausesCorruptIndex'
+            excludeTestsMatching 'org.apache.lucene.index.TestDemoParallelLeafReader'
+            excludeTestsMatching 'org.apache.lucene.index.TestDirectoryReader.testFilesOpenClose'
+            excludeTestsMatching 'org.apache.lucene.index.TestFieldsReader'
+            excludeTestsMatching 'org.apache.lucene.index.TestSortingCodecReader.testSortOnAddIndicesRandom'
+            excludeTestsMatching 'org.apache.lucene.util.bkd.TestBKD.testBitFlippedOnPartition1'
+            excludeTestsMatching 'org.apache.lucene.util.bkd.TestBKD.testBitFlippedOnPartition2'
+
+            // ── Category C: Encrypted file size ≠ plaintext size ──
+            // The encryption footer adds bytes to each file. Tests that create raw
+            // IndexInput slices based on file length, or compare sorted byte output
+            // against expected plaintext, fail because the content length differs.
+            // See LUCENE_INJECTION_EXCLUSIONS.md §C for details.
+            excludeTestsMatching 'org.apache.lucene.util.packed.TestDirectMonotonic'
+            excludeTestsMatching 'org.apache.lucene.util.TestOfflineSorter'
+            excludeTestsMatching 'org.apache.lucene.search.TestIndexOrDocValuesQuery.testUseIndexForSelectiveMultiValueQueries'
+
+            // ── Category D: EOF buffering differences ──
+            // Crypto buffering handles EOF differently — doesn't throw IOException on read-past-EOF.
+            // See LUCENE_INJECTION_EXCLUSIONS.md §D for details.
+            excludeTestsMatching 'org.apache.lucene.codecs.lucene90.TestLucene90CompoundFormat.testReadPastEOF'
+            excludeTestsMatching 'org.apache.lucene.document.TestField.testKnnVectorField'
+
+            // ── Category E: Cascading merge thread failure ──
+            // Crypto directory errors during merge cause unrecoverable IndexWriter state.
+            // See LUCENE_INJECTION_EXCLUSIONS.md §E for details.
+            excludeTestsMatching 'org.apache.lucene.search.TestBoolean2'
+
+            // ── Category F: Temp file / directory handling ──
+            // IOException "Is a directory" when crypto directory tries to encrypt a path
+            // that is actually a directory, not a file.
+            // See LUCENE_INJECTION_EXCLUSIONS.md §F for details.
+            excludeTestsMatching 'org.apache.lucene.index.TestIndexWriterOnDiskFull.testAddIndexOnDiskFull'
+        }
+
+        testLogging {
+            events "passed", "skipped", "failed"
+            showStandardStreams = true
+        }
+    }
+}
+
+task allLuceneIntegTests {
+    dependsOn luceneCryptoNIOFSIntegTest, luceneBufferPoolIntegTest, luceneHybridIntegTest
+    group = 'verification'
+    description = 'Run all Lucene core tests against all encrypted directory types'
 }

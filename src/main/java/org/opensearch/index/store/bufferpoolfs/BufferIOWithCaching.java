@@ -53,7 +53,7 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
     private static final int BLOCK_MASK = BLOCK - 1;
 
     /**
-     * Creates a new CryptoIndexOutput
+     * Creates a new BufferIOWithCaching.
      *
      * @param name The name of the output
      * @param path The path to write to
@@ -63,8 +63,8 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
      * @param blockCache the cache for storing decrypted block data
      * @param provider the security provider
      * @param encryptionMetadataCache the encryption metadata cache
+     * @param writeCacheMode controls whether writes populate the block cache
      * @throws IOException If there is an I/O error
-     * @throws IllegalArgumentException If key length is invalid
      */
     public BufferIOWithCaching(
         String name,
@@ -74,13 +74,14 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
         Pool<RefCountedMemorySegment> memorySegmentPool,
         BlockCache<RefCountedMemorySegment> blockCache,
         Provider provider,
-        EncryptionMetadataCache encryptionMetadataCache
+        EncryptionMetadataCache encryptionMetadataCache,
+        WriteCacheMode writeCacheMode
     )
         throws IOException {
         super(
             "FSIndexOutput(path=\"" + path + "\")",
             name,
-            new EncryptedOutputStream(os, path, key, memorySegmentPool, blockCache, provider, encryptionMetadataCache),
+            new EncryptedOutputStream(os, path, key, memorySegmentPool, blockCache, provider, encryptionMetadataCache, writeCacheMode),
             CHUNK_SIZE
         );
     }
@@ -98,6 +99,7 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
         private final long frameSize;
         private final long frameSizeMask;
 
+        private final WriteCacheMode writeCacheMode;
         private final EncryptionAlgorithm algorithm;
         private final Provider provider;
         private final EncryptionMetadataCache encryptionMetadataCache;
@@ -111,9 +113,9 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
         private int totalFrames = 0;
         private boolean isClosed = false;
 
-        // Partial block tracking for final block caching
+        // Partial block tracking for final block caching (only used in WRITE_THROUGH mode)
         private long lastCachedBlockOffset = -1;
-        private byte[] partialBlockBuffer = new byte[CACHE_BLOCK_SIZE];
+        private byte[] partialBlockBuffer;
         private int partialBlockLength = 0;
 
         EncryptedOutputStream(
@@ -123,7 +125,8 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
             Pool<RefCountedMemorySegment> memorySegmentPool,
             BlockCache<RefCountedMemorySegment> blockCache,
             Provider provider,
-            EncryptionMetadataCache encryptionMetadataCache
+            EncryptionMetadataCache encryptionMetadataCache,
+            WriteCacheMode writeCacheMode
         ) {
             super(os);
             this.path = path;
@@ -132,6 +135,10 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
             this.buffer = new byte[BUFFER_SIZE];
             this.memorySegmentPool = memorySegmentPool;
             this.blockCache = blockCache;
+            this.writeCacheMode = writeCacheMode;
+            if (writeCacheMode == WriteCacheMode.WRITE_THROUGH) {
+                this.partialBlockBuffer = new byte[CACHE_BLOCK_SIZE];
+            }
             this.provider = provider;
             this.encryptionMetadataCache = encryptionMetadataCache;
 
@@ -230,17 +237,19 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
         }
 
         private void processAndWrite(byte[] data, int arrayOffset, int length) throws IOException {
+            final boolean cacheOnWrite = writeCacheMode == WriteCacheMode.WRITE_THROUGH;
             int offsetInBuffer = 0;
-            final MemorySegment full = MemorySegment.ofArray(data);
+            final MemorySegment full = cacheOnWrite ? MemorySegment.ofArray(data) : null;
 
             while (offsetInBuffer < length) {
                 long absoluteOffset = streamOffset + offsetInBuffer;
-                long blockAlignedOffset = absoluteOffset & ~CACHE_BLOCK_MASK;
                 int blockOffset = (int) (absoluteOffset & CACHE_BLOCK_MASK);
                 int chunkLen = Math.min(length - offsetInBuffer, CACHE_BLOCK_SIZE - blockOffset);
 
-                // Cache plaintext data for reads
-                cacheBlockIfEligible(full, arrayOffset + offsetInBuffer, blockAlignedOffset, blockOffset, chunkLen);
+                if (cacheOnWrite) {
+                    long blockAlignedOffset = absoluteOffset & ~CACHE_BLOCK_MASK;
+                    cacheBlockIfEligible(full, arrayOffset + offsetInBuffer, blockAlignedOffset, blockOffset, chunkLen);
+                }
 
                 // Encrypt and write to disk
                 writeEncryptedChunk(data, arrayOffset + offsetInBuffer, chunkLen, absoluteOffset);
@@ -361,7 +370,9 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
                 super.close();
 
                 // Cache the final partial block if present (avoids disk I/O for immediate reads)
-                cacheFinalPartialBlock();
+                if (writeCacheMode == WriteCacheMode.WRITE_THROUGH) {
+                    cacheFinalPartialBlock();
+                }
 
                 // signal the kernel to flush the file cacehe
                 // but we don't call flush aggresevley in small files

@@ -46,6 +46,7 @@ import org.opensearch.index.store.kms_encryption_context.EncryptionContextResolv
 import org.opensearch.index.store.kms_encryption_context.EncryptionContextResolverFactory;
 import org.opensearch.index.store.metrics.CryptoMetricsService;
 import org.opensearch.index.store.metrics.ErrorType;
+import org.opensearch.index.store.bufferpoolfs.WriteCacheMode;
 import org.opensearch.index.store.niofs.CryptoNIOFSDirectory;
 import org.opensearch.index.store.pool.PoolBuilder;
 import org.opensearch.index.store.read_ahead.Worker;
@@ -516,7 +517,8 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
             directoryCache,
             loader,
             readaheadWorker,
-            encryptionMetadataCache
+            encryptionMetadataCache,
+            WriteCacheMode.WRITE_THROUGH
         );
     }
 

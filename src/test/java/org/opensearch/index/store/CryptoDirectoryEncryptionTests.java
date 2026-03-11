@@ -488,7 +488,8 @@ public class CryptoDirectoryEncryptionTests extends OpenSearchTestCase {
                 blockCacheA,
                 blockLoaderA,
                 readAheadWorkerA,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                CryptoTestDirectoryFactory.resolveWriteCacheMode()
             )
         ) {
             // Write data
@@ -566,7 +567,8 @@ public class CryptoDirectoryEncryptionTests extends OpenSearchTestCase {
                 blockCacheA,
                 blockLoaderA,
                 readAheadWorkerA,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                CryptoTestDirectoryFactory.resolveWriteCacheMode()
             )
         ) {
             // Write data
@@ -643,7 +645,8 @@ public class CryptoDirectoryEncryptionTests extends OpenSearchTestCase {
                 blockCacheA,
                 blockLoaderA,
                 readAheadWorkerA,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                CryptoTestDirectoryFactory.resolveWriteCacheMode()
             )
         ) {
             // Write data
@@ -721,7 +724,8 @@ public class CryptoDirectoryEncryptionTests extends OpenSearchTestCase {
                 blockCacheA,
                 blockLoaderA,
                 readAheadWorkerA,
-                encryptionMetadataCache
+                encryptionMetadataCache,
+                CryptoTestDirectoryFactory.resolveWriteCacheMode()
             )
         ) {
             // Write data

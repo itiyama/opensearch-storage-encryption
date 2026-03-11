@@ -77,6 +77,13 @@ public class CryptoNIOFSDirectory extends NIOFSDirectory {
             ensureOpen();
             ensureCanRead(name);
             Path path = getDirectory().resolve(name);
+
+            // Empty files and files smaller than minimum footer size cannot be encrypted
+            long rawFileSize = Files.size(path);
+            if (rawFileSize == 0 || rawFileSize < EncryptionMetadataTrailer.MIN_FOOTER_SIZE) {
+                return super.openInput(name, context);
+            }
+
             FileChannel fc = FileChannel.open(path, StandardOpenOption.READ);
             boolean success = false;
 
@@ -91,6 +98,10 @@ public class CryptoNIOFSDirectory extends NIOFSDirectory {
                 );
                 success = true;
                 return indexInput;
+            } catch (EncryptionFooter.NotOSEFFileException e) {
+                // File is not encrypted — fall back to plain NIO read
+                IOUtils.closeWhileHandlingException(fc);
+                return super.openInput(name, context);
             } finally {
                 if (!success) {
                     IOUtils.closeWhileHandlingException(fc);
