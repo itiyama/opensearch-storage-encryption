@@ -4,38 +4,21 @@
  */
 package org.opensearch.index.store;
 
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
-
 import java.io.IOException;
 import java.nio.file.Path;
 import java.security.Provider;
 import java.security.Security;
-import java.time.Duration;
-import java.util.Set;
-
-import javax.crypto.spec.SecretKeySpec;
 
 import org.apache.lucene.store.LockFactory;
-import org.opensearch.common.Randomness;
 import org.opensearch.index.store.block.RefCountedMemorySegment;
-import org.opensearch.index.store.block_cache.BlockCache;
-import org.opensearch.index.store.block_cache.BlockCacheKey;
-import org.opensearch.index.store.block_cache.BlockCacheValue;
 import org.opensearch.index.store.block_cache.CaffeineBlockCache;
 import org.opensearch.index.store.block_loader.CryptoDirectIOBlockLoader;
 import org.opensearch.index.store.bufferpoolfs.BufferPoolDirectory;
 import org.opensearch.index.store.cipher.EncryptionMetadataCache;
 import org.opensearch.index.store.hybrid.HybridCryptoDirectory;
 import org.opensearch.index.store.key.KeyResolver;
-import org.opensearch.index.store.metrics.CryptoMetricsService;
 import org.opensearch.index.store.pool.MemorySegmentPool;
 import org.opensearch.index.store.pool.Pool;
-import org.opensearch.index.store.read_ahead.Worker;
-import org.opensearch.telemetry.metrics.MetricsRegistry;
-
-import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
 
 /**
  * Thin wrapper around HybridCryptoDirectory with the (Path, LockFactory) constructor
@@ -44,12 +27,6 @@ import com.github.benmanes.caffeine.cache.Caffeine;
  */
 public class TestableHybridCryptoDirectory extends HybridCryptoDirectory {
 
-    private static final Set<String> NIO_EXTENSIONS = Set.of("si", "cfe", "fnm", "fdx", "fdm");
-
-    // No-op worker — read-ahead is not needed for correctness testing.
-    // Avoids thread pool creation which triggers Lucene's ThreadLeakControl.
-    private static final Worker NOOP_WORKER = new NoOpWorker();
-
     public TestableHybridCryptoDirectory(Path path, LockFactory lockFactory) throws IOException {
         super(
             lockFactory,
@@ -57,9 +34,9 @@ public class TestableHybridCryptoDirectory extends HybridCryptoDirectory {
             Security.getProvider("SunJCE"),
             getThreadKeyResolver(),
             getThreadMetadataCache(),
-            NIO_EXTENSIONS
+            CryptoTestDirectoryFactory.NIO_EXTENSIONS
         );
-        initMetricsSafe();
+        CryptoTestDirectoryFactory.initMetrics();
         // Don't clean up TL_KEY_RESOLVER — all directory instances on the same thread
         // must share the same key so that files written by one instance can be read by another.
         // TL_POOL and TL_METADATA_CACHE are also kept for consistency.
@@ -74,10 +51,7 @@ public class TestableHybridCryptoDirectory extends HybridCryptoDirectory {
     private static KeyResolver getThreadKeyResolver() {
         KeyResolver kr = TL_KEY_RESOLVER.get();
         if (kr == null) {
-            byte[] rawKey = new byte[32];
-            Randomness.get().nextBytes(rawKey);
-            kr = mock(KeyResolver.class);
-            when(kr.getDataKey()).thenReturn(new SecretKeySpec(rawKey, "AES"));
+            kr = CryptoTestDirectoryFactory.createKeyResolver();
             TL_KEY_RESOLVER.set(kr);
         }
         return kr;
@@ -101,31 +75,6 @@ public class TestableHybridCryptoDirectory extends HybridCryptoDirectory {
         return pool;
     }
 
-    private static CaffeineBlockCache<RefCountedMemorySegment, RefCountedMemorySegment> createBlockCache(
-        Pool<RefCountedMemorySegment> pool,
-        KeyResolver keyResolver,
-        EncryptionMetadataCache metadataCache
-    ) {
-        CryptoDirectIOBlockLoader blockLoader = new CryptoDirectIOBlockLoader(pool, keyResolver, metadataCache);
-        Cache<BlockCacheKey, BlockCacheValue<RefCountedMemorySegment>> caffeineCache = Caffeine
-            .newBuilder()
-            .maximumSize(100)
-            .expireAfterAccess(Duration.ofMinutes(5))
-            .recordStats()
-            .executor(Runnable::run) // run removal listener synchronously to release pool segments immediately
-            .removalListener((BlockCacheKey key, BlockCacheValue<RefCountedMemorySegment> value, com.github.benmanes.caffeine.cache.RemovalCause cause) -> {
-                if (value != null) {
-                    try {
-                        value.close();
-                    } catch (Exception e) {
-                        // ignore in tests
-                    }
-                }
-            })
-            .build();
-        return new CaffeineBlockCache<>(caffeineCache, blockLoader, 100);
-    }
-
     private static BufferPoolDirectory createBufferPoolDirectory(Path path, LockFactory lockFactory) throws IOException {
         KeyResolver keyResolver = getThreadKeyResolver();
         EncryptionMetadataCache metadataCache = getThreadMetadataCache();
@@ -133,50 +82,10 @@ public class TestableHybridCryptoDirectory extends HybridCryptoDirectory {
         Pool<RefCountedMemorySegment> pool = getThreadPool();
 
         CaffeineBlockCache<RefCountedMemorySegment, RefCountedMemorySegment> blockCache =
-            createBlockCache(pool, keyResolver, metadataCache);
+            CryptoTestDirectoryFactory.createBlockCache(pool, keyResolver, metadataCache, 100);
         CryptoDirectIOBlockLoader blockLoader = new CryptoDirectIOBlockLoader(pool, keyResolver, metadataCache);
 
-        return new BufferPoolDirectory(path, lockFactory, provider, keyResolver, pool, blockCache, blockLoader, NOOP_WORKER, metadataCache, CryptoTestDirectoryFactory.resolveWriteCacheMode());
-    }
-
-    private static void initMetricsSafe() {
-        try {
-            CryptoMetricsService.initialize(mock(MetricsRegistry.class));
-        } catch (Exception e) {
-            // already initialized
-        }
-    }
-
-    /**
-     * No-op worker that never schedules read-ahead. Read-ahead is a performance
-     * optimization, not needed for correctness testing. Avoids creating background
-     * threads that trigger Lucene's ThreadLeakControl.
-     */
-    private static class NoOpWorker implements Worker {
-        @Override
-        public <T extends AutoCloseable> boolean schedule(
-            BlockCache<T> blockCache,
-            Path path, long offset, long blockCount
-        ) {
-            return false;
-        }
-
-        @Override
-        public boolean isRunning() { return true; }
-
-        @Override
-        public int getQueueSize() { return 0; }
-
-        @Override
-        public int getQueueCapacity() { return 0; }
-
-        @Override
-        public void cancel(Path path) { }
-
-        @Override
-        public boolean isReadAheadPaused() { return false; }
-
-        @Override
-        public void close() { }
+        return new BufferPoolDirectory(path, lockFactory, provider, keyResolver, pool, blockCache, blockLoader,
+            CryptoTestDirectoryFactory.NOOP_WORKER, metadataCache, CryptoTestDirectoryFactory.resolveWriteCacheMode());
     }
 }

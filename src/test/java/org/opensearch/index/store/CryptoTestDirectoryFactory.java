@@ -48,7 +48,10 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 public final class CryptoTestDirectoryFactory {
 
     private static final Provider PROVIDER = Security.getProvider("SunJCE");
-    private static final Set<String> NIO_EXTENSIONS = Set.of("si", "cfe", "fnm", "fdx", "fdm");
+    public static final Set<String> NIO_EXTENSIONS = Set.of("si", "cfe", "fnm", "fdx", "fdm");
+
+    /** No-op worker for tests — avoids threads that trigger Lucene's ThreadLeakControl. */
+    public static final Worker NOOP_WORKER = new NoOpWorker();
 
     private CryptoTestDirectoryFactory() {}
 
@@ -96,21 +99,9 @@ public final class CryptoTestDirectoryFactory {
         KeyResolver keyResolver = createKeyResolver();
         EncryptionMetadataCache metadataCache = new EncryptionMetadataCache();
         Pool<RefCountedMemorySegment> pool = new MemorySegmentPool(131072, 8192);
-
+        CaffeineBlockCache<RefCountedMemorySegment, RefCountedMemorySegment> blockCache =
+            createBlockCache(pool, keyResolver, metadataCache, 1000);
         CryptoDirectIOBlockLoader blockLoader = new CryptoDirectIOBlockLoader(pool, keyResolver, metadataCache);
-
-        Cache<BlockCacheKey, BlockCacheValue<RefCountedMemorySegment>> caffeineCache = Caffeine
-            .newBuilder()
-            .maximumSize(1000)
-            .expireAfterAccess(Duration.ofMinutes(5))
-            .recordStats()
-            .build();
-
-        CaffeineBlockCache<RefCountedMemorySegment, RefCountedMemorySegment> blockCache = new CaffeineBlockCache<>(
-            caffeineCache,
-            blockLoader,
-            1000
-        );
 
         ExecutorService executor = Executors.newFixedThreadPool(4);
         Worker worker = new QueuingWorker(100, executor);
@@ -123,38 +114,77 @@ public final class CryptoTestDirectoryFactory {
         KeyResolver keyResolver = createKeyResolver();
         EncryptionMetadataCache metadataCache = new EncryptionMetadataCache();
         Pool<RefCountedMemorySegment> pool = new MemorySegmentPool(131072, 8192);
-
+        CaffeineBlockCache<RefCountedMemorySegment, RefCountedMemorySegment> blockCache =
+            createBlockCache(pool, keyResolver, metadataCache, 1000);
         CryptoDirectIOBlockLoader blockLoader = new CryptoDirectIOBlockLoader(pool, keyResolver, metadataCache);
-
-        Cache<BlockCacheKey, BlockCacheValue<RefCountedMemorySegment>> caffeineCache = Caffeine
-            .newBuilder()
-            .maximumSize(1000)
-            .expireAfterAccess(Duration.ofMinutes(5))
-            .recordStats()
-            .build();
-
-        CaffeineBlockCache<RefCountedMemorySegment, RefCountedMemorySegment> blockCache = new CaffeineBlockCache<>(
-            caffeineCache,
-            blockLoader,
-            1000
-        );
 
         ExecutorService executor = Executors.newFixedThreadPool(4);
         Worker worker = new QueuingWorker(100, executor);
 
         BufferPoolDirectory bufferPoolDir = new BufferPoolDirectory(
-            path,
-            lockFactory,
-            PROVIDER,
-            keyResolver,
-            pool,
-            blockCache,
-            blockLoader,
-            worker,
-            metadataCache,
-            resolveWriteCacheMode()
+            path, lockFactory, PROVIDER, keyResolver, pool, blockCache, blockLoader, worker, metadataCache, resolveWriteCacheMode()
         );
 
         return new HybridCryptoDirectory(lockFactory, bufferPoolDir, PROVIDER, keyResolver, metadataCache, NIO_EXTENSIONS);
+    }
+
+    /** Creates a Caffeine block cache with synchronous cleanup, suitable for tests. */
+    public static CaffeineBlockCache<RefCountedMemorySegment, RefCountedMemorySegment> createBlockCache(
+        Pool<RefCountedMemorySegment> pool,
+        KeyResolver keyResolver,
+        EncryptionMetadataCache metadataCache,
+        int maxSize
+    ) {
+        CryptoDirectIOBlockLoader blockLoader = new CryptoDirectIOBlockLoader(pool, keyResolver, metadataCache);
+        Cache<BlockCacheKey, BlockCacheValue<RefCountedMemorySegment>> caffeineCache = Caffeine
+            .newBuilder()
+            .maximumSize(maxSize)
+            .expireAfterAccess(Duration.ofMinutes(5))
+            .recordStats()
+            .executor(Runnable::run)
+            .removalListener((BlockCacheKey key, BlockCacheValue<RefCountedMemorySegment> value, com.github.benmanes.caffeine.cache.RemovalCause cause) -> {
+                if (value != null) {
+                    try {
+                        value.close();
+                    } catch (Exception e) {
+                        // ignore in tests
+                    }
+                }
+            })
+            .build();
+        return new CaffeineBlockCache<>(caffeineCache, blockLoader, maxSize);
+    }
+
+    /**
+     * No-op worker that never schedules read-ahead. Read-ahead is a performance
+     * optimization, not needed for correctness testing. Avoids creating background
+     * threads that trigger Lucene's ThreadLeakControl.
+     */
+    static final class NoOpWorker implements Worker {
+        @Override
+        public <T extends AutoCloseable> boolean schedule(
+            org.opensearch.index.store.block_cache.BlockCache<T> blockCache,
+            Path path, long offset, long blockCount
+        ) {
+            return false;
+        }
+
+        @Override
+        public boolean isRunning() { return true; }
+
+        @Override
+        public int getQueueSize() { return 0; }
+
+        @Override
+        public int getQueueCapacity() { return 0; }
+
+        @Override
+        public void cancel(Path path) { }
+
+        @Override
+        public boolean isReadAheadPaused() { return false; }
+
+        @Override
+        public void close() { }
     }
 }

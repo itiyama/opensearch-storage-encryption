@@ -242,11 +242,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
 
         // WRITE_THROUGH populates cache on write; READ_THROUGH does not
         if (randomWriteCacheMode == WriteCacheMode.WRITE_THROUGH) {
-            if (randomWriteCacheMode == WriteCacheMode.WRITE_THROUGH) {
             verify(mockCache, atLeastOnce()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
-        } else {
-            verify(mockCache, never()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
-        }
         } else {
             verify(mockCache, never()).put(any(BlockCacheKey.class), any(RefCountedMemorySegment.class));
         }
